@@ -40,6 +40,7 @@ try:
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
+    from games import GameTracker
     from local_ai import LocalAI
     from persona import LINES, gendered, line, set_user
     from avatar import Avatar
@@ -64,6 +65,7 @@ DEFAULTS = {
     "roam_chance": 0.5,
     "teleport_on_answer": True,
     "search_when_unsure": True,
+    "track_games": True,     # замечать запущенные игры, считать время и помнить их (games.json)
     "voice_volume": 100,     # громкость голоса Капри 0..100 (общая громкость Windows не меняется)
     "mic_gain": 1.0,         # громкость микрофона для Капри: 1 — как есть, 2 — вдвое громче
     "mic_sensitivity": 100,  # 100 — слышит всё; меньше — тихий шум и фон отбрасываются
@@ -269,6 +271,7 @@ class Capri(QObject):
         self.config_mtime = self._config_mtime()
         self.zapret_checked = False  # предлагали ли уже исправить zapret в этом сеансе
         self.actions.local = self.local
+        self.game_tracker = GameTracker(self.actions.games, self._on_game_event) if cfg.get("track_games", True) else None
         self.speaker = Speaker(cfg)
         self.jobs = queue.Queue()
         self.awake_until = 0.0
@@ -306,6 +309,14 @@ class Capri(QObject):
             self.jobs.put(("say", CONFIG_ERROR))
         threading.Thread(target=self._chatter_loop, daemon=True).start()  # сам проверяет, включено ли
         threading.Thread(target=self._prewarm_voice, daemon=True).start()
+        if self.game_tracker:
+            self.game_tracker.start()
+
+    def _on_game_event(self, kind, key, minutes):
+        """Трекер игр (его поток): Капри комментирует только когда игра закрылась, поверх игры не лезет."""
+        text = self.actions.on_game_event(kind, key, minutes)
+        if text:
+            self.jobs.put(("say", text))
 
     def _prewarm_voice(self):
         """Через полминуты после запуска озвучиваем в фоне постоянные фразы и свои ответы — потом они

@@ -10,7 +10,7 @@ import subprocess
 import time
 import urllib.request
 
-from persona import CHARACTER, SPEECH_RULES, user_context
+from persona import CHARACTER, SPEECH_RULES, extra_topics, user_context
 
 log = logging.getLogger("capri")
 URL = "http://127.0.0.1:11434"
@@ -259,7 +259,7 @@ class LocalAI:
                 {"role": "system", "content": SYSTEM + "\n" + user_context()},
                 {"role": "user", "content":
                  "Ты сама решила ненадолго появиться на экране. Скажи одну короткую спонтанную фразу, "
-                 f"до пятнадцати слов. Тема: {random.choice(CHATTER_TOPICS)}. "
+                 f"до пятнадцати слов. Тема: {random.choice(CHATTER_TOPICS + extra_topics())}. "
                  "Не спрашивай, чем помочь, и не упоминай команды."},
             ], max_tokens=60)
         except Exception:

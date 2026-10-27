@@ -18,7 +18,9 @@ from dataclasses import dataclass
 import psutil
 
 import automation
+import games
 import media
+import persona
 from persona import line
 
 log = logging.getLogger("capri")
@@ -949,8 +951,20 @@ class Actions:
         self.youtube_opened_at = 0.0  # когда Капри последний раз открывала YouTube
         self.media_paused = None      # какой плеер Капри поставила на паузу
         self.local = None
+        self.games = games.GameBook(os.path.join(base_dir, "games.json"), norm, translit)
+        self.game_announce = set()   # игры, о которых Капри скажет, когда их закроют
+        self.game_spoke_at = 0.0
+        persona.CONTEXT_PROVIDERS.append(self.games.summary)
+        persona.TOPIC_PROVIDERS.append(self.games.chatter_topics)
         self.routes = [
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
+            # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
+            (games.TEACH_RE, self.game_teach),
+            (games.FORGET_RE, self.game_forget),
+            (games.NOTE_RE, self.game_note),
+            (games.INFO_RE, self.game_info),
+            (games.TIME_RE, self.game_time),
+            (games.LIST_RE, self.game_list),
             (r"^(спрячься|скройся|исчезни|пока|отбой|свободна)\b|"
              r"^(уйди|уходи|убирайся|свали|сгинь|испарись|скрой себя|убери себя)\b|"
              r"(уйди|уходи|убирайся|свали|пропади|исчезни) (с|из) (экрана|монитора|глаз)", self.hide),
@@ -1028,6 +1042,7 @@ class Actions:
              r"(?P<q>.+)$", self.video),
             (r"^(открой|включи|покажи|запусти|поставь)( мне)? (на|в) (ютуб\w*|youtube) (?P<q>.+)$", self.video),
             (r"^(найди|поищи|загугли|погугли|ищи)( в интернете| в гугле| в google)? (?P<q>.+)$", self.search),
+            (games.LAUNCH_RE, self.game_launch),  # знакомая игра; иначе None, и команда идёт дальше
             (r"^(открой|запусти|включи|зайди на|перейди на|покажи) (?P<t>.+)$", self.open),
             (r"^((сними|снять) (задачу|процесс\w*)|(заверши|завершить|убей|убить|останови|закрой) "
              r"(все )?(процесс\w*|задачу|задачи)|кильни|килльни|грохни|прибей) (?P<t>.+)$", self.kill_process),
@@ -1067,7 +1082,7 @@ class Actions:
         if custom:
             return custom
         # «запомни … как X и Y» — название целиком, не цепочка команд
-        whole = any(re.match(p, c) for p in (REMEMBER_RE, FORGET_RE, REPLY_RE, FORGET_REPLY_RE))
+        whole = any(re.match(p, c) for p in (REMEMBER_RE, FORGET_RE, REPLY_RE, FORGET_REPLY_RE, *games.WHOLE))
         steps = None if whole else automation.split_chain(c)
         if steps:
             try:
@@ -1210,6 +1225,128 @@ class Actions:
             return Reply(line("forget_missing", t=name))
         err = self.remember(section, name, None)
         return Reply(line("remember_fail", e=err) if err else line("forget_ok", t=name))
+
+    # --- игры пользователя (учёт и память — в games.py) ---
+    def _learn_about(self, key):
+        """Фоном узнаёт об игре из Википедии, чтобы потом рассказать о ней. Чужую статью не берём."""
+        g = self.games.get(key)
+        if not g or g.get("about"):
+            return
+        text = wiki_summary(g["name"] + " игра", 2)
+        if text and games.about_matches(g["name"], text):
+            self.games.set_about(key, text)
+
+    def on_game_event(self, kind, key, minutes):
+        """Событие трекера → что сказать вслух (или None). Говорим только когда игру закрыли."""
+        g = self.games.get(key)
+        if not g:
+            return None
+        if kind == "new":
+            self.game_announce.add(key)
+            threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+            return None
+        if kind != "end":
+            return None
+        first = key in self.game_announce
+        self.game_announce.discard(key)
+        now = time.time()
+        if first:
+            text = line("game_new", t=g["name"], d=games.fmt_minutes(max(minutes, 1)))
+        elif minutes >= 30 and now - self.game_spoke_at > 3 * 3600:
+            text = line("game_end", t=g["name"], d=games.fmt_minutes(minutes))
+        else:
+            return None
+        self.game_spoke_at = now
+        return text
+
+    def game_teach(self, c, m):
+        """«запомни эту игру как терария» — игра, окно которой сейчас на экране."""
+        name = re.sub(r"^(как|под названием|под именем|с названием|назови)\s+", "", (m.group("name") or "").strip())
+        name = name.strip(" «»\"")
+        if not name:
+            return Reply(line("game_noname"))
+        exe = automation.window_exe(ctypes.windll.user32.GetForegroundWindow())
+        base = os.path.splitext(os.path.basename(exe or ""))[0].lower()
+        if not exe or base in PROTECTED_PROCS or base in games.GENERIC_HOSTS:
+            return Reply(line("game_no_window"))
+        key, _ = self.games.teach(name, exe)
+        threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+        return Reply(line("game_taught", t=name))
+
+    def game_forget(self, c, m):
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        if key is None:
+            return None  # не игра из списка — пусть решает обычное «забудь программу»
+        return Reply(line("game_forgot", t=self.games.forget(name)))
+
+    def game_note(self, c, m):
+        """«запиши про игру: на третьем боссе нужен лук» — заметка к игре, которая запущена или была последней."""
+        key = self.games.current()
+        if key is None:
+            return Reply(line("game_note_none"))
+        note = m.group("note").strip()
+        self.games.add_note(key, note)
+        return Reply(line("game_note", t=self.games.get(key)["name"], n=note[:80]))
+
+    def game_list(self, c, m):
+        top = self.games.top(3)
+        if not top:
+            return Reply(line("game_none"))
+        parts = [line("game_top", t=top[0][1]["name"], d=games.fmt_minutes(top[0][1]["minutes"]))]
+        if len(top) > 1:
+            parts.append(line("game_others", t=", ".join(f"«{g['name']}»" for _, g in top[1:])))
+        if self.games.running():
+            parts.append(line("game_running", t=", ".join(f"«{n}»" for n in self.games.running())))
+        return Reply(" ".join(parts))
+
+    def game_time(self, c, m):
+        key = self.games.find(m.group("name"))
+        if key is None:
+            return None  # «сколько я играл сегодня» — не про игру из списка
+        g = self.games.get(key)
+        text = line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"])
+        if g["last_played"] and key not in self.games.active:
+            text += " " + line("game_last", w=games.ago(g["last_played"]))
+        return Reply(text)
+
+    def game_info(self, c, m):
+        """«расскажи про игру террария» — что Капри о ней узнала и что ты сам записал."""
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        g = self.games.get(key) if key else None
+        about = g.get("about") if g else None
+        if not about:
+            about = wiki_summary(name + " игра", 2)
+            if not (about and games.about_matches(name, about)):
+                about = None
+            elif key:
+                self.games.set_about(key, about)
+        if not about and not g:
+            return None  # ничего не знаю — пусть ответит нейросеть
+        parts = [about] if about else []
+        if g:
+            parts.append(line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"]))
+            if g["notes"]:
+                parts.append("Твоя заметка: " + g["notes"][-1]["text"] + ".")
+        return Reply(line("game_info", t=" ".join(parts)))
+
+    def game_launch(self, c, m):
+        """«запусти террарию» — только для игр из списка и только если это не свой сайт или программа."""
+        name = m.group("name").strip()
+        n = norm(name)
+        if n in self.sites or n in self.apps or n in self.aliases:
+            return None
+        key = self.games.find(name, min_score=0.8)
+        if key is None:
+            return None
+        g = self.games.get(key)
+        if key in self.games.active:
+            return Reply(line("game_already", t=g["name"]))
+        if not os.path.isfile(g["exe"]):
+            return Reply(line("game_launch_fail", t=g["name"]))
+        subprocess.Popen([g["exe"]], cwd=os.path.dirname(g["exe"]))
+        return Reply(line("game_launch", t=g["name"]))
 
     def updates(self, c, m):
         """Страница Капри на GitHub — там новые версии."""
