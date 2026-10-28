@@ -67,6 +67,9 @@ DEFAULTS = {
     "teleport_on_answer": True,
     "search_when_unsure": True,
     "track_games": True,     # замечать запущенные игры, считать время и помнить их (games.json)
+    "steam_confirm": True,   # перед отправкой сообщения другу в Steam прочитать его вслух и ждать «да»
+    "steam_friends": {},     # свои названия друзей: {"вася": "xX_Vasya_Xx"} (ник из Steam или числовой id)
+    "steam_path": "",        # папка Steam, если автоопределение не сработало
     "commentary": True,      # комментировать, что ты делаешь, и стебать за проигрыши
     "commentary_minutes": 10,  # не чаще раза в столько минут (комментарии про игры — вне этого лимита)
     "react_to_voice": False,   # стебать за «слили!», сказанное без имени, пока идёт игра (слушает фон)
@@ -533,7 +536,7 @@ class Capri(QObject):
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
                     "user_name_mode", "user_name", "user_gender", "commentary", "commentary_minutes",
-                    "react_to_voice"):
+                    "react_to_voice", "steam_confirm", "steam_friends", "steam_path"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)

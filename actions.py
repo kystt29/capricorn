@@ -22,6 +22,7 @@ import commentary
 import games
 import media
 import persona
+import steam
 from persona import line
 
 log = logging.getLogger("capri")
@@ -961,6 +962,7 @@ class Actions:
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
             (commentary.TOGGLE_RE, self.commentary_toggle),
             (commentary.LOSS_RE, self.loss_cmd),
+            (steam.SEND_RE, self.steam_message),  # до обычной печати «напиши …»
             # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
             (games.TEACH_RE, self.game_teach),
             (games.FORGET_RE, self.game_forget),
@@ -1085,7 +1087,8 @@ class Actions:
         if custom:
             return custom
         # «запомни … как X и Y» — название целиком, не цепочка команд
-        whole = any(re.match(p, c) for p in (REMEMBER_RE, FORGET_RE, REPLY_RE, FORGET_REPLY_RE, *games.WHOLE))
+        whole = any(re.match(p, c) for p in (REMEMBER_RE, FORGET_RE, REPLY_RE, FORGET_REPLY_RE, *games.WHOLE,
+                                             steam.SEND_RE))
         steps = None if whole else automation.split_chain(c)
         if steps:
             try:
@@ -1228,6 +1231,37 @@ class Actions:
             return Reply(line("forget_missing", t=name))
         err = self.remember(section, name, None)
         return Reply(line("remember_fail", e=err) if err else line("forget_ok", t=name))
+
+    # --- сообщения друзьям в Steam (поиск друга и отправка — в steam.py) ---
+    def steam_message(self, c, m):
+        """«напиши Васе в стиме, что я опоздаю» — находит друга, читает текст вслух и после «да» отправляет."""
+        friends = steam.load_friends(self.cfg.get("steam_path", ""))
+        aliases = self.cfg.get("steam_friends") or {}
+
+        def find(query):
+            return steam.find_friend(query, friends, aliases, norm, translit)
+        if not friends and not aliases:
+            return Reply(line("steam_no_friends"))
+        parsed = steam.parse(c, find)
+        if parsed is None:
+            return None
+        kind, who, text = parsed
+        if kind == "no_friend":
+            return Reply(line("steam_no_friend", t=who or "без имени"))
+        _, steam64, label = who
+        if kind == "no_text":
+            return Reply(line("steam_no_text", who=label))
+        if not steam.is_running():
+            return Reply(line("steam_not_running"))
+
+        def do():
+            if not steam.send_message(steam64, label, text):
+                return Reply(line("steam_chat_fail", who=label))
+            return Reply(line("steam_sent", who=label, t=text))
+        if self.cfg.get("steam_confirm", True):
+            self.pending = do  # дальше handle() ждёт «да»
+            return Reply(line("steam_ask", who=label, t=text))
+        return do()
 
     # --- подколки (наблюдатель — в commentary.py) ---
     def commentary_toggle(self, c, m):
