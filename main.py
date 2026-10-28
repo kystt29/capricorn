@@ -40,6 +40,7 @@ try:
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
+    from commentary import TOGGLE_RE, Commentator, compose, heard_loss
     from games import GameTracker
     from local_ai import LocalAI
     from persona import LINES, gendered, line, set_user
@@ -66,6 +67,9 @@ DEFAULTS = {
     "teleport_on_answer": True,
     "search_when_unsure": True,
     "track_games": True,     # замечать запущенные игры, считать время и помнить их (games.json)
+    "commentary": True,      # комментировать, что ты делаешь, и стебать за проигрыши
+    "commentary_minutes": 10,  # не чаще раза в столько минут (комментарии про игры — вне этого лимита)
+    "react_to_voice": False,   # стебать за «слили!», сказанное без имени, пока идёт игра (слушает фон)
     "voice_volume": 100,     # громкость голоса Капри 0..100 (общая громкость Windows не меняется)
     "mic_gain": 1.0,         # громкость микрофона для Капри: 1 — как есть, 2 — вдвое громче
     "mic_sensitivity": 100,  # 100 — слышит всё; меньше — тихий шум и фон отбрасываются
@@ -272,6 +276,7 @@ class Capri(QObject):
         self.zapret_checked = False  # предлагали ли уже исправить zapret в этом сеансе
         self.actions.local = self.local
         self.game_tracker = GameTracker(self.actions.games, self._on_game_event) if cfg.get("track_games", True) else None
+        self.commentator = Commentator(self.actions.games, self._on_comment, self._can_comment, self.cfg)
         self.speaker = Speaker(cfg)
         self.jobs = queue.Queue()
         self.awake_until = 0.0
@@ -311,12 +316,36 @@ class Capri(QObject):
         threading.Thread(target=self._prewarm_voice, daemon=True).start()
         if self.game_tracker:
             self.game_tracker.start()
+        self.commentator.start()  # сам проверяет, включены ли комментарии
 
     def _on_game_event(self, kind, key, minutes):
-        """Трекер игр (его поток): Капри комментирует только когда игра закрылась, поверх игры не лезет."""
+        """Трекер игр (его поток): Капри говорит только когда игра закрылась, поверх игры не лезет.
+        Подколка («слил», марафон) важнее обычного «наиграл N минут»; первое знакомство с игрой — не стебём."""
+        first = key in self.actions.game_announce
         text = self.actions.on_game_event(kind, key, minutes)
-        if text:
+        found = self.commentator.on_game_event(kind, key, minutes)
+        if found and not first:
+            self.jobs.put(("roast",) + found)
+        elif text:
             self.jobs.put(("say", text))
+
+    def _can_comment(self, strict):
+        """Можно ли сейчас вставить реплику: Капри молчит и не занята, а для обычных подколок ещё и ничего
+        на весь экран (игра, фильм) и нет разговора с ней."""
+        if self.speaking or not self.jobs.empty():
+            return False
+        return not strict or (time.time() - self.last_activity > 20 and not fullscreen_app_active())
+
+    def _on_comment(self, situation, detail):
+        """Наблюдатель (его поток): подколку придумает рабочий поток, чтобы не стоять в ожидании нейросети."""
+        self.jobs.put(("roast", situation, detail))
+
+    def overheard(self, text):
+        """Услышала разговор без имени. Реагирует, только если включено "react_to_voice" и идёт игра."""
+        if self.cfg.get("react_to_voice") and heard_loss(text) and not self.speaking:
+            found = self.commentator.overheard()
+            if found:
+                self.jobs.put(("roast",) + found)
 
     def _prewarm_voice(self):
         """Через полминуты после запуска озвучиваем в фоне постоянные фразы и свои ответы — потом они
@@ -428,9 +457,11 @@ class Capri(QObject):
             return
         woke = self.has_wake(text)
         if not woke and now > self.awake_until:
+            self.overheard(text)
             return
         cmd = self.strip_wake(text) if woke else text
-        if STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3:
+        # «перестань меня стебать» — не «стоп», а настройка комментариев
+        if STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3 and not re.search(TOGGLE_RE, cmd.lower()):
             # «Капри, стоп» — замолчать, остановить автопрокрутку и слушать дальше
             self.awake_until = now + self.cfg["listen_window_seconds"]
             if self.actions.stop_background():
@@ -461,6 +492,12 @@ class Capri(QObject):
         self.cfg["chatter"] = bool(on)
         save_setting("chatter", bool(on))
         log.info("Самостоятельные появления: %s", "включены" if on else "выключены")
+
+    def set_commentary(self, on):
+        """Галочка в трее и «Капри, не комментируй»: комментировать ли действия и стебать за проигрыши."""
+        self.cfg["commentary"] = bool(on)
+        save_setting("commentary", bool(on))
+        log.info("Комментарии: %s", "включены" if on else "выключены")
 
     def set_search_when_unsure(self, on):
         """Галочка в трее: открывать ли Google, когда Капри не знает ответа. Сразу и запоминается."""
@@ -495,7 +532,8 @@ class Capri(QObject):
             return
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
-                    "user_name_mode", "user_name", "user_gender"):
+                    "user_name_mode", "user_name", "user_gender", "commentary", "commentary_minutes",
+                    "react_to_voice"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)
@@ -589,6 +627,13 @@ class Capri(QObject):
 
     def _process(self, job):
         kind = job[0]
+        if kind == "roast":
+            # подколка: придумываем здесь (нейросеть может думать несколько секунд), говорим как при болтовне
+            text = compose(job[1], job[2], self.local.quip if self.local else None, line)
+            self.summon.emit()
+            if not self.say(text):
+                self.mode.emit("idle", 0.0)
+            return
         if kind == "chatter":
             text = self.chatter_line()
             if random.random() < self.cfg.get("roam_chance", 0.5):
@@ -641,6 +686,8 @@ class Capri(QObject):
         reply = self.actions.handle(cmd)
         if reply is not None and reply.action in ("mic_info", "mic_next"):
             reply = self.mic_command(reply.action)
+        elif reply is not None and reply.action and reply.action.startswith("commentary:"):
+            self.set_commentary(reply.action.endswith("on"))
         if reply is None:
             if self.cfg.get("enable_ai") and self.ai.available:
                 reply = Reply(self.ai.ask(cmd), "answer")
@@ -868,9 +915,16 @@ def main():
             chatter_act.toggled.connect(capri.set_chatter)
             menu.addAction(chatter_act)
 
-            def sync_search(a=search_act, b=chatter_act):
+            # галочка: комментирует ли Капри действия и стебёт ли за проигрыши (commentary)
+            comment_act = QAction("Комментировать мои действия", menu)
+            comment_act.setCheckable(True)
+            comment_act.toggled.connect(capri.set_commentary)
+            menu.addAction(comment_act)
+
+            def sync_search(a=search_act, b=chatter_act, d=comment_act):
                 capri.reload_config_if_changed(speak=False)  # могли поменять в config.json руками
-                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True)):
+                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True),
+                                          (d, "commentary", True)):
                     act.blockSignals(True)
                     act.setChecked(bool(capri.cfg.get(key, default)))
                     act.blockSignals(False)

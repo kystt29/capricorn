@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import psutil
 
 import automation
+import commentary
 import games
 import media
 import persona
@@ -958,6 +959,8 @@ class Actions:
         persona.TOPIC_PROVIDERS.append(self.games.chatter_topics)
         self.routes = [
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
+            (commentary.TOGGLE_RE, self.commentary_toggle),
+            (commentary.LOSS_RE, self.loss_cmd),
             # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
             (games.TEACH_RE, self.game_teach),
             (games.FORGET_RE, self.game_forget),
@@ -1225,6 +1228,21 @@ class Actions:
             return Reply(line("forget_missing", t=name))
         err = self.remember(section, name, None)
         return Reply(line("remember_fail", e=err) if err else line("forget_ok", t=name))
+
+    # --- подколки (наблюдатель — в commentary.py) ---
+    def commentary_toggle(self, c, m):
+        """«не комментируй» / «комментируй меня»: включает и выключает подколки (само переключение делает main)."""
+        off = commentary.toggle_wants_off(c)
+        return Reply(line("commentary_off" if off else "commentary_on"), "commentary:" + ("off" if off else "on"))
+
+    def loss_cmd(self, c, m):
+        """«я слил», «меня убили» — Капри стебёт. Если подколки выключены, фраза идёт дальше, как обычный разговор."""
+        if not self.cfg.get("commentary", True):
+            return None
+        key = self.games.current()
+        g = self.games.get(key) if key else None
+        quip = self.local.quip if self.local else None
+        return Reply(commentary.compose("loss", {"t": g["name"] if g else ""}, quip, line))
 
     # --- игры пользователя (учёт и память — в games.py) ---
     def _learn_about(self, key):

@@ -268,6 +268,20 @@ class LocalAI:
         text = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", text).strip()
         return text if 5 < len(text) < 160 and re.search(r"[.!?…]$", text) else None
 
+    def quip(self, task):
+        """Короткая подколка по ситуации (task — что произошло и как постебать). None — если не вышло."""
+        try:
+            text = self._chat([
+                {"role": "system", "content": SYSTEM + "\n" + user_context()},
+                {"role": "user", "content": "Ты наблюдаешь за пользователем и подкалываешь его. Ситуация: " + task},
+            ], max_tokens=60)
+        except Exception as e:
+            log.info("Подколка: локальная модель недоступна: %s", e)
+            return None
+        text = drop_third_person(re.sub(r"\s+", " ", FOREIGN.sub("", text)).strip().strip('"«»'))
+        text = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", text).strip()
+        return text if 5 < len(text) < 160 and re.search(r"[.!?…]$", text) else None
+
     def summarize_report(self, report):
         try:
             return self._chat([
