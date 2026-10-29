@@ -1,16 +1,23 @@
-"""Капри комментирует, что ты делаешь, и стебёт, когда ты проигрываешь.
+"""Капри комментирует, что ты делаешь: стебёт, подбадривает, радуется и учится на твоей реакции.
 
 Что она видит и откуда:
 - какая программа сейчас в фокусе (раз в 15 секунд) и как давно ты ничего не нажимал;
 - запуски и закрытия игр (их ведёт games.py);
-- твои фразы «я слил», «меня убили» — по имени и, если включено "react_to_voice", и без имени, пока идёт игра.
+- твои слова: «я слил», «меня убили», «ура, прошёл», «получилось» — по имени и, если включено "react_to_voice",
+  и без имени, пока идёт игра;
+- по желанию ("screen_reactions": true) — надписи на экране в игре: «YOU DIED», «Победа», «Game over» (screen.py).
 
-Победа или поражение в самой игре ей не видны, поэтому «проигрыш» — это то, что ты сам сказал, и косвенные признаки:
-катки подряд по несколько минут, быстрый выход, многочасовой марафон.
+Победа или поражение в самой игре ей напрямую не видны, поэтому исход — это то, что ты сказал, надпись на экране
+и косвенные признаки: каты подряд по несколько минут, быстрый выход, многочасовой марафон, серии побед и поражений.
 
-Приватность: заголовок окна используется только на месте, чтобы понять, что это (видео, чаты, работа), — он нигде
-не сохраняется, не пишется в журнал и никуда не отправляется. Подколки придумывает только локальная нейросеть;
-режим Claude для этого не используется. Выключить: "commentary": false, галочка в трее или «Капри, не комментируй»."""
+Тон: на поражение чаще стёб, на серию поражений — подбадривание, на победу — похвала (иногда с подколом).
+Что тебе заходит, она запоминает по твоей реакции (learning.py) и подстраивает частоту и тон.
+
+Приватность: заголовок окна используется только на месте, он нигде не сохраняется и не пишется в журнал. Название
+видео (только видео, и не с «чувствительных» страниц: банки, почта, пароли, инкогнито) получает лишь локальная
+нейросеть, чтобы отреагировать по делу: "commentary_titles": false отключает и это. Подколки придумывает только
+локальная нейросеть, режим Claude для этого не используется. Выключить всё: "commentary": false, галочка в трее или
+«Капри, не комментируй»."""
 import logging
 import ntpath
 import random
@@ -20,6 +27,7 @@ import time
 from collections import namedtuple
 
 import games
+import persona
 
 log = logging.getLogger("capri")
 
@@ -29,35 +37,52 @@ SWITCH_CONFIRM = 2            # столько проверок подряд д�
 WORK_STREAK_MIN = 10          # сколько минут работы нужно, чтобы уход в видео или чаты считался прокрастинацией
 PROCRASTINATE_WINDOW = 120    # и за сколько секунд после работы он должен случиться
 DEFAULT_COOLDOWN = 45 * 60
-COOLDOWN = {                  # как редко повторяется один и тот же вид подколки (секунды)
-    "loss": 120, "retry": 600, "quick_quit": 900, "marathon": 3600,
-    "procrastinate": 1800, "night": 3 * 3600, "long_sit": 2 * 3600,
+COOLDOWN = {                  # как редко повторяется один и тот же вид реплики (секунды)
+    "loss": 120, "win": 120, "streak_loss": 900, "streak_win": 900, "retry": 600, "quick_quit": 900,
+    "marathon": 3600, "procrastinate": 1800, "night": 3 * 3600, "long_sit": 2 * 3600, "video_next": 900,
 }
 LONG_MINUTES = {"video": 60, "social": 45, "work": 120, "office": 120, "web": 90}
 LONG_SIT_MINUTES = 180
-ENTER_CHANCE = {"video": 0.35, "social": 0.25}
+ENTER_CHANCE = {"video": 0.6, "social": 0.4, "music": 0.25, "work": 0.2, "office": 0.2, "create": 0.3}
+VIDEO_NEXT_CHANCE = 0.5
 MARATHON_MINUTES = 180
 RETRY_WINDOW = 15 * 60        # новая сессия той же игры не позже чем через столько после прошлой…
 RETRY_MAX_MINUTES = 25        # …и обе короче стольки минут — похоже на серию проигранных катов
 QUICK_QUIT_MINUTES = 6
+STREAK_WINDOW = 20 * 60       # столько подряд побед или поражений за это время — серия
+STREAK_N = 3
 
 Sample = namedtuple("Sample", "exe title idle")
+
+# Тон по умолчанию и из чего выбираем (с базовыми шансами). Дальше шансы сдвигает learning.py по твоей реакции.
+DEFAULT_MODE = {"loss": "roast", "win": "cheer"}
+MODES = {"loss": (("roast", "cheer"), (0.7, 0.3)), "win": (("cheer", "roast"), (0.6, 0.4))}
 
 
 # ---------------- фразы ----------------
 # Фразы проходят через norm() из actions.py: нижний регистр, «ё» → «е», без знаков препинания.
 
-_VERBS = (r"(проиграл\w*|слил\w*|сдох\w*|умер\w*|вайпнул\w*|зафейлил\w*|продул\w*|слетел\w*|"
-          r"не прошел|не прошла|не смог\w* пройти|не справил\w*)")
+_LOSE = (r"(проиграл\w*|слил\w*|сдох\w*|умер\w*|вайпнул\w*|зафейлил\w*|продул\w*|слетел\w*|"
+         r"не прошел|не прошла|не смог\w* пройти|не справил\w*)")
 LOSS_RE = (r"^(ну |блин |да |все |всё |ой |ай )*("
-           rf"((я|мы) (опять |снова |только что |уже |все |всё )*{_VERBS})|"
+           rf"((я|мы) (опять |снова |только что |уже |все |всё )*{_LOSE})|"
            r"((меня|нас) (опять |снова |только что )*(убили|убил|слили|разнесли|вынесли|уничтожили))|"
            r"((опять|снова) (проиграл\w*|слил\w*|сдох\w*|умер\w*|вайп\w*))|"
            r"(проигрыш|вайп|поражение)"
            r")( |$)")
 
-# То, что можно услышать без имени, пока идёт игра («слили», «убили»): строже, чтобы не реагировать на любой разговор.
-OVERHEARD_RE = re.compile(r"\b(слил\w*|проиграл\w*|сдох\w*|убили|вайп\w*|вынесли|разнесли|опять умер|снова умер)\b")
+_WIN = r"(выиграл\w*|победил\w*|прошел|прошла|прошли|выбил\w*|поймал\w*|справил\w*|затащил\w*|залутал\w*)"
+WIN_RE = (r"^(ну |блин |да |ура |наконец |наконец-то |все |всё |ой )*("
+          rf"((я|мы) (опять |снова |только что |наконец-то |наконец |все-таки |таки |уже )*{_WIN})|"
+          r"((у меня|у нас) (наконец-то |наконец |все |всё )?(получилось|вышло))|"
+          r"(получилось|победа|выиграли|затащили|затащил)|"
+          r"((мне|нам) (наконец-то |наконец )?(повезло|выпал\w*))"
+          r")( |$)")
+
+# То, что можно услышать без имени, пока идёт игра: строже, чтобы не реагировать на любой разговор.
+OVERHEARD_LOSS = re.compile(r"\b(слил\w*|проиграл\w*|сдох\w*|убили|вайп\w*|вынесли|разнесли|опять умер|снова умер)\b")
+OVERHEARD_WIN = re.compile(r"\b(выиграл\w*|победил\w*|получилось|затащил\w*|победа|ура|повезло|выбил\w*)\b")
+LAUGH_RE = re.compile(r"\b(ха ?ха\w*|ахах\w*|хаха\w*|ржу)\b")
 
 _OFF = (r"\bне (комментируй|коментируй|стебай|подкалывай)|"
         r"(перестань|хватит|прекрати)( меня)? (комментировать|коментировать|стебать|подкалывать)|"
@@ -72,9 +97,27 @@ def toggle_wants_off(c):
     return bool(re.search(_OFF, c))
 
 
+def _plain(text):
+    return (text or "").lower().replace("ё", "е")
+
+
 def heard_loss(text):
     """Похоже ли услышанное без имени на «слили / проиграл» (для react_to_voice)."""
-    return bool(OVERHEARD_RE.search((text or "").lower().replace("ё", "е")))
+    return bool(OVERHEARD_LOSS.search(_plain(text)))
+
+
+def heard_outcome(text):
+    """«loss» / «win» / None: что за исход услышали без имени."""
+    t = _plain(text)
+    if OVERHEARD_LOSS.search(t):
+        return "loss"
+    if OVERHEARD_WIN.search(t):
+        return "win"
+    return None
+
+
+def heard_laugh(text):
+    return bool(LAUGH_RE.search(_plain(text)))
 
 
 # ---------------- что за занятие ----------------
@@ -90,6 +133,8 @@ EXE_CATEGORIES = {
     "windowsterminal": "work", "wt": "work", "cmd": "work", "powershell": "work",
     "winword": "office", "excel": "office", "powerpnt": "office", "onenote": "office", "soffice": "office",
     "spotify": "music", "yandexmusic": "music", "aimp": "music",
+    "photoshop": "create", "blender": "create", "premiere pro": "create", "afterfx": "create",
+    "illustrator": "create", "figma": "create", "davinciresolve": "create", "krita": "create", "obs64": "create",
 }
 # Что значит страница в браузере — по заголовку окна. Заголовок дальше не идёт и нигде не хранится.
 TITLE_CATEGORIES = [
@@ -97,10 +142,28 @@ TITLE_CATEGORIES = [
     (r"вконтакте|vk\.com|telegram|whatsapp|instagram|tiktok|reddit|twitter|facebook|одноклассники", "social"),
     (r"github|stack overflow|stackoverflow|документаци|localhost|leetcode|jupyter|codeforces|docs\.", "work"),
 ]
+# Страницы, о которых Капри не должна говорить, даже если это видео-сайт или вкладка рядом: банки, почта, пароли…
+SENSITIVE_TITLE = re.compile(
+    r"парол|password|\bбанк|\bbank|сбер|тинькофф|tinkoff|\bвход\b|\blog ?in\b|\bsign ?in\b|авторизац|private|"
+    r"инкогнито|incognito|inprivate|оплат|payment|checkout|\bкарт[аыуе]\b|\bcard\b|паспорт|госуслуг|"
+    r"\bпочт(а|ы|у|е|ой)\b|mail|inbox|\bписьм|кошел|wallet|2fa|код подтвержд|verification", re.IGNORECASE)
+TITLE_NOISE = re.compile(
+    r"\s*[-–—|]\s*(youtube|ютуб|twitch|rutube|vk видео|vk video|яндекс\.?\s*браузер|google chrome|chrome|"
+    r"microsoft\s*edge|mozilla firefox|firefox|opera|brave|vivaldi|netflix|кинопоиск).*$", re.IGNORECASE)
+
+
+def clean_title(title):
+    """Название видео для локальной нейросети или None, если страницу лучше не обсуждать. Нигде не сохраняется."""
+    t = (title or "").replace("‎", "").strip()
+    t = re.sub(r"^\(\d+\)\s*", "", t)          # «(3) …» — счётчик уведомлений в начале заголовка
+    t = TITLE_NOISE.sub("", t).strip()
+    if len(t) < 3 or SENSITIVE_TITLE.search(title or ""):
+        return None
+    return t[:80]
 
 
 def classify(exe, title, game_paths=()):
-    """«game» / «video» / «social» / «work» / «office» / «web» / «music» или None (не комментируем)."""
+    """«game» / «video» / «social» / «work» / «office» / «create» / «web» / «music» или None (не комментируем)."""
     if not exe:
         return None
     if ntpath.normcase(exe) in game_paths or games.detect(exe):
@@ -140,14 +203,24 @@ def sample_foreground():
 
 # ---------------- как озвучить ----------------
 
-HINTS = {  # что сказать нейросети, чтобы она придумала свою подколку
+HINTS = {  # что сказать нейросети, чтобы она придумала свою фразу (ключ: ситуация или ситуация_тон)
     "loss": "он только что проиграл{game}. Постебай его за это.",
+    "loss_cheer": "он только что проиграл{game}. Подбодри его: скажи, что бывает, и подтолкни попробовать ещё.",
+    "win": "у него только что получилось, он выиграл{game}. Похвали его от души.",
+    "win_roast": "у него только что получилось, он выиграл{game}. Похвали с ехидцей: намекни, что ему просто повезло.",
+    "streak_loss": "он проигрывает несколько раз подряд{game}. Подбодри его и предложи собраться или передохнуть.",
+    "streak_win": "у него серия побед подряд{game}. Похвали и подначь, что дальше будет сложнее.",
     "retry": "он уже несколько раз подряд играет короткие катки в «{t}» — похоже, проигрывает и не сдаётся. Постебай.",
     "quick_quit": "он закрыл игру «{t}» всего через {d} после запуска. Постебай, что сдался.",
     "marathon": "он только что закрыл игру «{t}», просидев в ней {d}. Постебай и намекни, что пора отдохнуть.",
     "procrastinate": "он поработал {d} и сразу ушёл смотреть видео или сидеть в чатах. Постебай за прокрастинацию.",
     "enter_video": "он открыл видео в интернете. Подколи.",
     "enter_social": "он зашёл в чаты и соцсети. Подколи.",
+    "enter_music": "он включил музыку. Подколи его вкус или похвали, как получится.",
+    "enter_work": "он сел работать. Подбодри его с ехидцей.",
+    "enter_office": "он открыл документы или таблицы. Посочувствуй и подбодри с иронией.",
+    "enter_create": "он занялся творчеством: рисует, монтирует или делает 3D. Подбодри его.",
+    "video_next": "он переключился на другое видео. Подколи.",
     "long_video": "он уже больше часа подряд смотрит видео. Постебай.",
     "long_social": "он уже долго сидит в соцсетях и чатах. Постебай.",
     "long_work": "он уже два часа подряд сидит за работой. Подколи и намекни на перерыв.",
@@ -156,42 +229,71 @@ HINTS = {  # что сказать нейросети, чтобы она при�
     "long_sit": "он сидит за компьютером три часа без перерыва. Подколи и намекни, что пора встать.",
     "night": "уже глубокая ночь, а он всё за компьютером. Подколи.",
 }
-STYLE = ("Скажи одну короткую язвительную, но дружескую фразу до пятнадцати слов. Без оскорблений личности и мата, "
-         "без эмодзи, не предлагай команд и не говори, что ты что-то сделала на компьютере.")
+TITLE_HINTS = {  # то же, если известно название видео (его видит только локальная нейросеть)
+    "enter_video": "он включил видео «{title}». Отреагируй на название: подколи или покажи интерес.",
+    "video_next": "он переключился на другое видео — «{title}». Отреагируй на название.",
+}
+STYLE = ("Скажи одну короткую фразу до пятнадцати слов, живо и по-дружески, с лёгким стёбом там, где он уместен. "
+         "Без оскорблений личности и мата, без эмодзи, не предлагай команд и не говори, что ты что-то сделала "
+         "на компьютере.")
 
 
-def compose(situation, detail, quip, line):
-    """Текст подколки: придумывает нейросеть (quip — функция «подсказка → фраза» или None),
-    а если она недоступна или промахнулась — готовая фраза из persona.LINES."""
+def _key(situation, mode):
+    """Ключ подсказки и фразы: тон по умолчанию — просто ситуация, другой тон — «ситуация_тон»."""
+    if not mode or mode == DEFAULT_MODE.get(situation):
+        return situation
+    return f"{situation}_{mode}"
+
+
+def compose(situation, detail, quip, line, learn=None):
+    """Текст реплики: придумывает нейросеть (quip — функция «подсказка → фраза» или None), а если она недоступна
+    или промахнулась — готовая фраза из persona.LINES. learn добавляет к подсказке примеры того, что тебе нравилось."""
     kw = {"t": "", "d": ""}
-    kw.update(detail or {})
+    kw.update({k: v for k, v in (detail or {}).items() if k not in ("mode", "title")})
+    mode = (detail or {}).get("mode")
+    title = (detail or {}).get("title")
+    key = _key(situation, mode)
     text = None
     if quip:
         game = f" в игре «{kw['t']}»" if kw["t"] else ""
+        if title and situation in TITLE_HINTS:
+            hint = TITLE_HINTS[situation].format(title=title)
+        else:
+            hint = (HINTS.get(key) or HINTS[situation]).format(game=game, **kw)
+        hint += " " + STYLE
+        if learn:
+            liked, disliked = learn.examples()
+            if liked:
+                hint += (" Ему нравились такие реплики (говори в таком духе, но не повторяй дословно): "
+                         + "; ".join(f"«{x}»" for x in liked) + ".")
+            if disliked:
+                hint += " Такое ему не понравилось, так не говори: " + "; ".join(f"«{x}»" for x in disliked) + "."
         try:
-            text = quip(HINTS[situation].format(game=game, **kw) + " " + STYLE)
+            text = quip(hint)
         except Exception:
             log.exception("Подколка через нейросеть")
     if text:
         return text
-    key = "c_" + situation
-    if situation == "loss" and kw["t"]:
-        key = "c_loss_game"
-    return line(key, **kw)
+    line_key = "c_" + key
+    if line_key not in persona.LINES:
+        line_key = "c_" + situation
+    if situation == "loss" and kw["t"] and line_key == "c_loss":
+        line_key = "c_loss_game"
+    return line(line_key, **kw)
 
 
 # ---------------- наблюдатель ----------------
 
 class Commentator:
-    """Следит за занятиями и решает, когда подколоть. Всё время и случайность подставляются снаружи,
-    чтобы логику можно было проверить без Windows.
+    """Следит за занятиями и исходами и решает, когда что сказать. Время и случайность подставляются снаружи, чтобы
+    логику можно было проверить без Windows.
 
     emit(ситуация, детали) — из потока наблюдателя; can_speak(strict) — можно ли сейчас говорить
-    (strict — ещё и не лезть поверх полноэкранных программ)."""
+    (strict — ещё и не лезть поверх полноэкранных программ); learn — learning.Learning (необязательно)."""
 
     def __init__(self, book, emit, can_speak, cfg, sample=sample_foreground, now=time.time,
-                 rand=random.random, hour=lambda: time.localtime().tm_hour):
-        self.book, self.emit, self.can_speak, self.cfg = book, emit, can_speak, cfg
+                 rand=random.random, hour=lambda: time.localtime().tm_hour, learn=None):
+        self.book, self.emit, self.can_speak, self.cfg, self.learn = book, emit, can_speak, cfg, learn
         self.sample, self.now, self.rand, self.hour = sample, now, rand, hour
         self.cat = None            # чем занят сейчас
         self.since = 0.0           # с какого момента
@@ -199,32 +301,49 @@ class Commentator:
         self.active_since = None   # с какого момента сидит без перерыва
         self.fired = set()         # какие «долго …» уже сказаны в этом занятии
         self.work_ended = None     # (когда, сколько минут) закончилась работа
+        self.vtitle, self.vpending, self.vpending_n = None, None, 0   # какое видео смотрит (только в памяти)
         self.last_comment = -1e9
         self.cool = {}
         self.started = {}          # игра → когда запущена
         self.last_end = {}         # игра → (когда закрыта, сколько минут)
+        self.outcomes = []         # (когда, «win»/«loss») — для серий
 
-    # --- настройки ---
+    # --- настройки и обучение ---
     def enabled(self):
         return bool(self.cfg.get("commentary", True))
 
+    def titles_on(self):
+        return bool(self.cfg.get("commentary_titles", True))
+
     def gap(self):
         try:
-            return max(1.0, float(self.cfg.get("commentary_minutes", 10))) * 60
+            minutes = max(1.0, float(self.cfg.get("commentary_minutes", 6)))
         except (TypeError, ValueError):
-            return 600.0
+            minutes = 6.0
+        return minutes * 60 * (self.learn.tempo if self.learn else 1.0)
+
+    def _w(self, situation):
+        return self.learn.weight(situation) if self.learn else 1.0
+
+    def render(self, situation, detail, quip, line):
+        """Готовый текст реплики; заодно запоминает, что и каким тоном сказано, чтобы понять, как ты на это ответишь."""
+        text = compose(situation, detail, quip, line, self.learn)
+        if self.learn:
+            self.learn.record_comment(situation, (detail or {}).get("mode"), text)
+        return text
 
     # --- решение «говорить или нет» ---
-    def _gate(self, situation, detail=None, strict=True, global_gap=True):
+    def _gate(self, situation, detail=None, strict=True, global_gap=True, force=False):
         if not self.enabled():
             return None
         now = self.now()
-        if now - self.cool.get(situation, -1e9) < COOLDOWN.get(situation, DEFAULT_COOLDOWN):
-            return None
-        if global_gap and now - self.last_comment < self.gap():
-            return None
-        if not self.can_speak(strict):
-            return None
+        if not force:
+            if now - self.cool.get(situation, -1e9) < COOLDOWN.get(situation, DEFAULT_COOLDOWN):
+                return None
+            if global_gap and now - self.last_comment < self.gap():
+                return None
+            if not self.can_speak(strict):
+                return None
         self.cool[situation] = self.last_comment = now
         return situation, detail or {}
 
@@ -233,6 +352,42 @@ class Commentator:
         if res:
             self.emit(*res)
         return res
+
+    # --- исходы: победа и поражение ---
+    def outcome(self, kind, detail=None, explicit=False):
+        """kind — «win» или «loss» (слова, надпись на экране, фраза без имени). Возвращает (ситуация, детали) или None.
+        Серия из трёх одинаковых исходов подряд даёт подбадривание (или похвалу и подначку); explicit — ты сам
+        сказал Капри, тогда она отвечает всегда."""
+        if not self.enabled() or kind not in ("win", "loss"):
+            return None
+        now = self.now()
+        self.outcomes = [(t, k) for t, k in self.outcomes if now - t < STREAK_WINDOW] + [(now, kind)]
+        tail = [k for _, k in self.outcomes[-STREAK_N:]]
+        candidates = [kind]
+        if len(tail) == STREAK_N and set(tail) == {kind}:
+            candidates.insert(0, "streak_" + kind)
+        for situation in candidates:
+            info = dict(detail or {})
+            if situation in MODES:
+                modes, base = MODES[situation]
+                info["mode"] = self.learn.pick_mode(modes, base) if self.learn else modes[0]
+            res = self._gate(situation, info, strict=False, global_gap=False, force=explicit)
+            if res:
+                return res
+        return None
+
+    def overheard(self, kind="loss"):
+        """Услышала «слили» или «ура» без имени (react_to_voice): реагируем, только если идёт игра или она закрылась
+        недавно."""
+        if not self.enabled():
+            return None
+        key = self.book.current()
+        now = self.now()
+        recent = key in self.last_end and now - self.last_end[key][0] < 300
+        if not (self.book.active or recent) or key is None:
+            return None
+        g = self.book.get(key)
+        return self.outcome(kind, {"t": g["name"] if g else ""})
 
     # --- игры ---
     def on_game_event(self, kind, key, minutes):
@@ -263,18 +418,6 @@ class Commentator:
             return None
         return self._gate(situation, detail, strict=False, global_gap=False)
 
-    def overheard(self):
-        """Услышала «слили» без имени (react_to_voice): подкалываем, только если идёт игра или она закрылась недавно."""
-        if not self.enabled():
-            return None
-        key = self.book.current()
-        now = self.now()
-        recent = key in self.last_end and now - self.last_end[key][0] < 300
-        if not (self.book.active or recent) or key is None:
-            return None
-        g = self.book.get(key)
-        return self._gate("loss", {"t": g["name"] if g else ""}, strict=False, global_gap=False)
-
     # --- обычные занятия ---
     def step(self):
         if not self.enabled():
@@ -285,39 +428,69 @@ class Commentator:
         now = self.now()
         if s.idle > IDLE_SECONDS:  # отошёл — серия прервана, говорить некому
             self.cat, self.pending, self.active_since = None, None, None
+            self.vtitle = None
             self.fired.clear()
             return
         if self.active_since is None:
             self.active_since = now
         cat = classify(s.exe, s.title, self.book.path_index())
+        if self.learn and cat:
+            self.learn.note_activity(cat, self.hour(), POLL_SECONDS / 60)
         if cat != self.cat:
             if cat == self.pending:
                 self.pending_n += 1
             else:
                 self.pending, self.pending_n = cat, 1
             if self.pending_n >= SWITCH_CONFIRM:
-                self._switch(cat, now)
+                self._switch(cat, now, s.title)
         else:
             self.pending, self.pending_n = None, 0
+        if self.cat == "video":
+            self._watch_video(s.title)
         if self.cat and self.cat != "game":
             self._check_long(now)
             self._check_night()
 
-    def _switch(self, new, now):
+    def _switch(self, new, now, title=""):
         old = self.cat
         if old in ("work", "office") and now - self.since >= WORK_STREAK_MIN * 60:
             self.work_ended = (now, (now - self.since) / 60)
         self.cat, self.since = new, now
         self.pending, self.pending_n = None, 0
         self.fired.discard("long")
-        if new not in ("video", "social"):
-            return
-        if self.work_ended and now - self.work_ended[0] <= PROCRASTINATE_WINDOW:
+        self.vtitle, self.vpending, self.vpending_n = (clean_title(title) if new == "video" else None), None, 0
+        if new in ("video", "social") and self.work_ended and now - self.work_ended[0] <= PROCRASTINATE_WINDOW:
             minutes = self.work_ended[1]
             self.work_ended = None
             self._fire("procrastinate", {"d": games.fmt_minutes(minutes)})
-        elif self.rand() < ENTER_CHANCE[new]:
-            self._fire("enter_" + new)
+            return
+        chance = ENTER_CHANCE.get(new)
+        if chance and self.rand() < chance * self._w("enter_" + new):
+            detail = {}
+            if new == "video" and self.titles_on() and self.vtitle:
+                detail["title"] = self.vtitle
+            self._fire("enter_" + new, detail)
+
+    def _watch_video(self, title):
+        """Следующее видео в той же вкладке: комментируем, но не на каждое."""
+        if not self.titles_on():
+            return
+        t = clean_title(title)
+        if not t:
+            return
+        if not self.vtitle:
+            self.vtitle = t
+        elif t != self.vtitle:
+            if t == self.vpending:
+                self.vpending_n += 1
+            else:
+                self.vpending, self.vpending_n = t, 1
+            if self.vpending_n >= SWITCH_CONFIRM:
+                self.vtitle, self.vpending, self.vpending_n = t, None, 0
+                if self.rand() < VIDEO_NEXT_CHANCE * self._w("video_next"):
+                    self._fire("video_next", {"title": t})
+        else:
+            self.vpending, self.vpending_n = None, 0
 
     def _check_long(self, now):
         minutes = (now - self.since) / 60

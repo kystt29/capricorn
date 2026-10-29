@@ -20,6 +20,7 @@ import psutil
 import automation
 import commentary
 import games
+import learning
 import media
 import persona
 import steam
@@ -953,6 +954,7 @@ class Actions:
         self.youtube_opened_at = 0.0  # когда Капри последний раз открывала YouTube
         self.media_paused = None      # какой плеер Капри поставила на паузу
         self.local = None
+        self.commentator = None   # наблюдатель commentary.Commentator: его ставит main
         self.games = games.GameBook(os.path.join(base_dir, "games.json"), norm, translit)
         self.game_announce = set()   # игры, о которых Капри скажет, когда их закроют
         self.game_spoke_at = 0.0
@@ -961,6 +963,9 @@ class Actions:
         self.routes = [
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
             (commentary.TOGGLE_RE, self.commentary_toggle),
+            (learning.LIKE_RE, self.feedback_like),        # «ха-ха», «в точку» — сразу после реплики Капри
+            (learning.DISLIKE_RE, self.feedback_dislike),  # «не смешно», «перебор»
+            (commentary.WIN_RE, self.win_cmd),
             (commentary.LOSS_RE, self.loss_cmd),
             (steam.SEND_RE, self.steam_message),  # до обычной печати «напиши …»
             # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
@@ -1269,14 +1274,40 @@ class Actions:
         off = commentary.toggle_wants_off(c)
         return Reply(line("commentary_off" if off else "commentary_on"), "commentary:" + ("off" if off else "on"))
 
-    def loss_cmd(self, c, m):
-        """«я слил», «меня убили» — Капри стебёт. Если подколки выключены, фраза идёт дальше, как обычный разговор."""
+    def _outcome_cmd(self, kind):
+        """«я слил» / «ура, прошёл»: стёб, подбадривание или похвала — по тому, что заходит. Если подколки выключены,
+        фраза идёт дальше, как обычный разговор."""
         if not self.cfg.get("commentary", True):
             return None
         key = self.games.current()
         g = self.games.get(key) if key else None
+        detail = {"t": g["name"] if g else ""}
         quip = self.local.quip if self.local else None
-        return Reply(commentary.compose("loss", {"t": g["name"] if g else ""}, quip, line))
+        if self.commentator:
+            found = self.commentator.outcome(kind, detail, explicit=True)  # сама позвала — отвечаем всегда
+            if found:
+                return Reply(self.commentator.render(found[0], found[1], quip, line))
+            return None
+        return Reply(commentary.compose(kind, detail, quip, line))
+
+    def loss_cmd(self, c, m):
+        return self._outcome_cmd("loss")
+
+    def win_cmd(self, c, m):
+        return self._outcome_cmd("win")
+
+    def _feedback(self, positive):
+        """Твоя реакция на только что сказанную реплику Капри. Без реплики это обычный разговор, и фраза идёт дальше."""
+        learn = self.commentator.learn if self.commentator else None
+        if not learn or not learn.feedback(positive):
+            return None
+        return Reply(line("feedback_like" if positive else "feedback_dislike"))
+
+    def feedback_like(self, c, m):
+        return self._feedback(True)
+
+    def feedback_dislike(self, c, m):
+        return self._feedback(False)
 
     # --- игры пользователя (учёт и память — в games.py) ---
     def _learn_about(self, key):

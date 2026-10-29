@@ -18,3 +18,6 @@ __pycache__/
 games.json
 games.json.tmp
 games.json.bad
+learning.json
+learning.json.tmp
+learning.json.bad
