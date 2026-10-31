@@ -31,6 +31,15 @@ log = logging.getLogger("capri")
 NO_WINDOW = 0x08000000
 
 
+FX_WORDS = {   # слово в команде -> (анимация, реплика); см. effects.py
+    "прыгни": ("bounce", "Оп! Вот так."), "попрыгай": ("bounce", "Оп-оп-оп!"),
+    "потрясись": ("shake", "Брр-р-р!"), "задрожи": ("shake", "Брр-р-р!"),
+    "кувырнись": ("flip", "Оп, разворот!"), "кувыркнись": ("flip", "Оп, разворот!"),
+    "вздохни": ("droop", "Уфф…"), "пульс": ("pulse", "Тук-тук."), "сердце": ("pulse", "Тук-тук."),
+}
+FX_RE = r"\b(прыгни|попрыгай|потрясись|задрожи|кувырнись|кувыркнись|вздохни|покажи\s+(?:пульс|сердце))"
+
+
 @dataclass
 class Reply:
     text: str
@@ -988,6 +997,7 @@ class Actions:
             (UPDATES_RE, self.updates),
             (REPLY_RE, self.reply_cmd),
             (FORGET_REPLY_RE, self.forget_reply_cmd),
+            (FX_RE, self.fx_cmd),
             (r"помаши|помахай|махни|помаши ручкой|поздоровайся", self.wave),
             (r"погуляй|прогуляйся|пройдись|прогулк", self.roam),
             (r"что ты (умеешь|можешь)|как\w* (у тебя )?команд|(назови|перечисли|скажи) (\S+ )?команд|"
@@ -1506,6 +1516,12 @@ class Actions:
 
     def hide(self, c, m):
         return Reply(line("hide"), "hide")
+
+    def fx_cmd(self, c, m):
+        for word, (name, text) in FX_WORDS.items():
+            if word in c:
+                return Reply(text, "fx:" + name)
+        return Reply("Не поняла, что показать.", None)
 
     def wave(self, c, m):
         return Reply(line("wave"), "wave")

@@ -40,6 +40,7 @@ try:
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
+    import effects
     from commentary import TOGGLE_RE, Commentator, heard_laugh, heard_outcome
     from freestyle import ANYTIME_RE, PROFANITY_CONTEXT, PROFANITY_RE, NoVision, describe
     from games import GameTracker
@@ -73,6 +74,7 @@ DEFAULTS = {
     "steam_confirm": True,   # перед отправкой сообщения другу в Steam прочитать его вслух и ждать «да»
     "steam_friends": {},     # свои названия друзей: {"вася": "xX_Vasya_Xx"} (ник из Steam или числовой id)
     "steam_path": "",        # папка Steam, если автоопределение не сработало
+    "animations": True,      # процедурные анимации: подпрыгивает от радости, дрожит от стёба
     "commentary": True,      # комментировать, что ты делаешь, и стебать за проигрыши
     "commentary_minutes": 6,   # не чаще раза в столько минут (комментарии про игры — вне этого лимита);
                                # дальше Капри сама подстраивает темп под твою реакцию
@@ -269,6 +271,7 @@ class Capri(QObject):
     subtitle = Signal(str)
     quit_app = Signal()
     anim = Signal(str)
+    fx = Signal(str)
     roam = Signal()
     hop = Signal()
     move_to = Signal(str)
@@ -377,6 +380,10 @@ class Capri(QObject):
         if self.speaking or not self.jobs.empty():
             return False
         return not strict or (time.time() - self.last_activity > 20 and not fullscreen_app_active())
+
+    def _play_fx(self, name):
+        if name and self.cfg.get("animations", True):
+            self.fx.emit(name)
 
     def _on_comment(self, situation, detail):
         """Наблюдатель (его поток): подколку придумает рабочий поток, чтобы не стоять в ожидании нейросети."""
@@ -703,6 +710,7 @@ class Capri(QObject):
             # подколка: придумываем здесь (нейросеть может думать несколько секунд), говорим как при болтовне
             text = self.commentator.render(job[1], job[2], self.local.quip if self.local else None, line)
             self.summon.emit()
+            self._play_fx(effects.for_situation(job[1], (job[2] or {}).get("mode")))
             if not self.say(text):
                 self.mode.emit("idle", 0.0)
             return
@@ -772,8 +780,11 @@ class Capri(QObject):
                 reply = Reply(answer, "answer") if answer else self.actions.fallback(cmd, force_search=bool(self.local))
         if reply.action == "answer" and self.cfg.get("teleport_on_answer"):
             self.hop.emit()  # отвечает, скача по экрану красной молнией
-        if reply.action == "wave":
+        if reply.action and reply.action.startswith("fx:"):
+            self._play_fx(reply.action[3:])
+        elif reply.action == "wave":
             self.anim.emit("capri")
+            self._play_fx("bounce")
         elif reply.action and reply.action.startswith("move:"):
             self.move_to.emit(reply.action[5:])
         elif reply.action == "roam":
@@ -877,6 +888,7 @@ def main():
     capri.subtitle.connect(avatar.set_subtitle)
     capri.quit_app.connect(app.quit)
     capri.anim.connect(avatar.play_anim)
+    capri.fx.connect(avatar.play_effect)
     capri.roam.connect(avatar.start_roam)
     capri.hop.connect(avatar.start_hopping)
     capri.move_to.connect(avatar.move_to_named)

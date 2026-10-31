@@ -5,6 +5,8 @@ import os
 import random
 import time
 
+import effects
+
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QPoint
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage, QRegion, QPainter, QPainterPath, QPen,
                            QPolygonF, QGuiApplication)
@@ -638,6 +640,12 @@ class Avatar(QWidget):
         if name in self.anims:
             self.anim, self.anim_start, self.anim_loop = name, time.time(), loop
 
+    def play_effect(self, name):
+        if self.state in ("visible", "appearing"):
+            # пока она только появляется, анимация стартует, когда появление закончится
+            wait = max(0, APPEAR_FRAMES - self.k) / 30 if self.state == "appearing" else 0.0
+            self.fx.play(name, wait)
+
     def set_mode(self, mode, seconds=0.0):
         if mode == "thinking" and self.mode != "thinking":
             self.play_anim("eyes", loop=True)
@@ -797,12 +805,20 @@ class Avatar(QWidget):
                 glitch = max(glitch, .08)
 
         fig = self._figure()
+        fxp = self.fx.pose(FIG_H)
+        glitch = max(glitch, fxp.glitch)
+        flash = flash or fxp.flash
         ox = oy = 0
         if glitch > 0 and random.random() < glitch * 0.6:
             ox = random.randint(-int(14 * glitch), int(14 * glitch))
             oy = random.randint(-int(6 * glitch), int(6 * glitch))
 
         p.save()
+        if fxp is not effects.REST:
+            p.translate(W / 2 + fxp.dx, FIG_H + fxp.dy)   # вращаем и растягиваем от «ног»
+            p.rotate(math.degrees(fxp.rot))
+            p.scale(fxp.sx, fxp.sy)
+            p.translate(-W / 2, -FIG_H)
         if yscale < 1 or xscale < 1:
             p.translate(W / 2, FIG_H / 2)
             p.scale((1 + (1 - yscale) * 0.4) * xscale, yscale * (1 + (1 - xscale) * 0.3))
