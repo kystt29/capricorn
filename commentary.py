@@ -26,6 +26,7 @@ import threading
 import time
 from collections import namedtuple
 
+import freestyle
 import games
 import persona
 
@@ -40,6 +41,7 @@ DEFAULT_COOLDOWN = 45 * 60
 COOLDOWN = {                  # как редко повторяется один и тот же вид реплики (секунды)
     "loss": 120, "win": 120, "streak_loss": 900, "streak_win": 900, "retry": 600, "quick_quit": 900,
     "marathon": 3600, "procrastinate": 1800, "night": 3 * 3600, "long_sit": 2 * 3600, "video_next": 900,
+    "idle": 1800, "back": 1800, "wallpaper": 600, "free": 60, "screen": 0,
 }
 LONG_MINUTES = {"video": 60, "social": 45, "work": 120, "office": 120, "web": 90}
 LONG_SIT_MINUTES = 180
@@ -51,6 +53,13 @@ RETRY_MAX_MINUTES = 25        # …и обе короче стольки мин�
 QUICK_QUIT_MINUTES = 6
 STREAK_WINDOW = 20 * 60       # столько подряд побед или поражений за это время — серия
 STREAK_N = 3
+IDLE_COMMENT_SECONDS = 300   # безделие: столько секунд без нажатий (но не больше IDLE_GONE_SECONDS — тогда тебя нет)
+IDLE_GONE_SECONDS = 1200
+BACK_IDLE_SECONDS = 1800     # вернулся после такого простоя — поздороваться
+FREE_MIN_MINUTES, FREE_MAX_MINUTES = 4, 9   # свободный режим: случайная реплика раз в столько минут
+WALLPAPER_SHARE = 0.2        # доля случайных реплик свободного режима, когда она смотрит на обои
+WALL_CHECK_SECONDS = 60
+ANYTIME_GAP_FACTOR = 0.4     # свободный режим: лимит между репликами во столько раз короче
 
 Sample = namedtuple("Sample", "exe title idle")
 
@@ -228,6 +237,11 @@ HINTS = {  # что сказать нейросети, чтобы она при�
     "long_web": "он уже полтора часа сидит в браузере. Подколи.",
     "long_sit": "он сидит за компьютером три часа без перерыва. Подколи и намекни, что пора встать.",
     "night": "уже глубокая ночь, а он всё за компьютером. Подколи.",
+    "idle": "он уже несколько минут сидит и ничего не делает. Подколи за безделие.",
+    "back": "он вернулся к компьютеру после долгого отсутствия. Подколи.",
+    "wallpaper": "у него на рабочем столе обои: {what}. Прокомментируй обои.",
+    "screen": "у него сейчас на экране: {what}. Прокомментируй, что видишь.",
+    "free": "он сейчас {act}. Скажи по этому поводу что угодно: подколи, удиви, подбодри.",
 }
 TITLE_HINTS = {  # то же, если известно название видео (его видит только локальная нейросеть)
     "enter_video": "он включил видео «{title}». Отреагируй на название: подколи или покажи интерес.",
@@ -236,6 +250,10 @@ TITLE_HINTS = {  # то же, если известно название вид�
 STYLE = ("Скажи одну короткую фразу до пятнадцати слов, живо и по-дружески, с лёгким стёбом там, где он уместен. "
          "Без оскорблений личности и мата, без эмодзи, не предлагай команд и не говори, что ты что-то сделала "
          "на компьютере.")
+STYLE_RUDE = ("Скажи одну короткую фразу до пятнадцати слов, живо, как друг, который стебёт по-доброму. Можно и нужно "
+              "материться: используй русский мат уместно и в тему. Ругай ситуацию и поступки, а не саму личность; не трогай "
+              "национальность, внешность, пол, здоровье и семью. Без эмодзи, не предлагай команд и не говори, что ты "
+              "что-то сделала на компьютере.")
 
 
 def _key(situation, mode):
@@ -245,10 +263,11 @@ def _key(situation, mode):
     return f"{situation}_{mode}"
 
 
-def compose(situation, detail, quip, line, learn=None):
+def compose(situation, detail, quip, line, learn=None, rude=False):
     """Текст реплики: придумывает нейросеть (quip — функция «подсказка → фраза» или None), а если она недоступна
-    или промахнулась — готовая фраза из persona.LINES. learn добавляет к подсказке примеры того, что тебе нравилось."""
-    kw = {"t": "", "d": ""}
+    или промахнулась — готовая фраза из persona.LINES. learn добавляет к подсказке примеры того, что тебе нравилось,
+    rude — с матом (подсказка и запасные фразы «r_…»)."""
+    kw = {"t": "", "d": "", "what": "", "act": ""}
     kw.update({k: v for k, v in (detail or {}).items() if k not in ("mode", "title")})
     mode = (detail or {}).get("mode")
     title = (detail or {}).get("title")
@@ -260,7 +279,7 @@ def compose(situation, detail, quip, line, learn=None):
             hint = TITLE_HINTS[situation].format(title=title)
         else:
             hint = (HINTS.get(key) or HINTS[situation]).format(game=game, **kw)
-        hint += " " + STYLE
+        hint += " " + (STYLE_RUDE if rude else STYLE)
         if learn:
             liked, disliked = learn.examples()
             if liked:
@@ -274,12 +293,18 @@ def compose(situation, detail, quip, line, learn=None):
             log.exception("Подколка через нейросеть")
     if text:
         return text
-    line_key = "c_" + key
-    if line_key not in persona.LINES:
-        line_key = "c_" + situation
-    if situation == "loss" and kw["t"] and line_key == "c_loss":
-        line_key = "c_loss_game"
-    return line(line_key, **kw)
+    normal = ["c_" + key, "c_" + situation]
+    if situation == "loss" and kw["t"] and normal[0] == "c_loss":
+        normal.insert(0, "c_loss_game")
+    wanted = []
+    if rude:
+        if situation == "loss" and kw["t"] and key == "loss":
+            wanted.append("r_loss_game")
+        wanted += ["r_" + key, "r_" + situation]
+    for k in wanted + normal:
+        if k in persona.LINES:
+            return line(k, **kw)
+    return line("c_free", **kw)
 
 
 # ---------------- наблюдатель ----------------
@@ -292,9 +317,16 @@ class Commentator:
     (strict — ещё и не лезть поверх полноэкранных программ); learn — learning.Learning (необязательно)."""
 
     def __init__(self, book, emit, can_speak, cfg, sample=sample_foreground, now=time.time,
-                 rand=random.random, hour=lambda: time.localtime().tm_hour, learn=None):
+                 rand=random.random, hour=lambda: time.localtime().tm_hour, learn=None, looker=None,
+                 wall=freestyle.wallpaper_signature, spawn=None):
         self.book, self.emit, self.can_speak, self.cfg, self.learn = book, emit, can_speak, cfg, learn
         self.sample, self.now, self.rand, self.hour = sample, now, rand, hour
+        self.looker = looker       # looker("wallpaper" | "screen") → описание картинки или None (модель с «глазами»)
+        self.wall = wall           # отпечаток текущих обоев — чтобы заметить смену
+        self.spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True, name="look").start())
+        self.idle_cat, self.idle_fired, self.idle_peak = None, False, 0.0
+        self.next_free = None      # когда следующая случайная реплика свободного режима
+        self.wall_sig, self.wall_checked = None, -1e9
         self.cat = None            # чем занят сейчас
         self.since = 0.0           # с какого момента
         self.pending, self.pending_n = None, 0
@@ -315,19 +347,26 @@ class Commentator:
     def titles_on(self):
         return bool(self.cfg.get("commentary_titles", True))
 
+    def anytime(self):
+        """Свободный режим: реплики чаще, без оглядки на полноэкранные программы, плюс случайные комментарии."""
+        return bool(self.cfg.get("commentary_anytime", False))
+
+    def rude(self):
+        return bool(self.cfg.get("profanity", False))
+
     def gap(self):
         try:
             minutes = max(1.0, float(self.cfg.get("commentary_minutes", 6)))
         except (TypeError, ValueError):
             minutes = 6.0
-        return minutes * 60 * (self.learn.tempo if self.learn else 1.0)
+        return minutes * 60 * (self.learn.tempo if self.learn else 1.0) * (ANYTIME_GAP_FACTOR if self.anytime() else 1.0)
 
     def _w(self, situation):
         return self.learn.weight(situation) if self.learn else 1.0
 
     def render(self, situation, detail, quip, line):
         """Готовый текст реплики; заодно запоминает, что и каким тоном сказано, чтобы понять, как ты на это ответишь."""
-        text = compose(situation, detail, quip, line, self.learn)
+        text = compose(situation, detail, quip, line, self.learn, rude=self.rude())
         if self.learn:
             self.learn.record_comment(situation, (detail or {}).get("mode"), text)
         return text
@@ -342,7 +381,7 @@ class Commentator:
                 return None
             if global_gap and now - self.last_comment < self.gap():
                 return None
-            if not self.can_speak(strict):
+            if not self.can_speak(strict and not self.anytime()):
                 return None
         self.cool[situation] = self.last_comment = now
         return situation, detail or {}
@@ -426,7 +465,20 @@ class Commentator:
         if s is None:
             return
         now = self.now()
-        if s.idle > IDLE_SECONDS:  # отошёл — серия прервана, говорить некому
+        if s.idle < 60:
+            if self.idle_peak >= BACK_IDLE_SECONDS:
+                self._fire("back")
+            self.idle_peak, self.idle_fired, self.idle_cat = 0.0, False, None
+        else:
+            self.idle_peak = max(self.idle_peak, s.idle)
+        if s.idle > IDLE_SECONDS:  # отошёл — серия прервана
+            if self.cat:
+                self.idle_cat = self.cat
+            # безделие: сидит и ничего не жмёт, а не смотрит видео, играет или слушает музыку (там тоже не жмут)
+            if (IDLE_COMMENT_SECONDS <= s.idle < IDLE_GONE_SECONDS and not self.idle_fired
+                    and self.idle_cat not in ("video", "game", "music")):
+                self.idle_fired = True
+                self._fire("idle")
             self.cat, self.pending, self.active_since = None, None, None
             self.vtitle = None
             self.fired.clear()
@@ -450,6 +502,9 @@ class Commentator:
         if self.cat and self.cat != "game":
             self._check_long(now)
             self._check_night()
+        self._check_wallpaper(now)
+        if self.anytime():
+            self._check_free(now)
 
     def _switch(self, new, now, title=""):
         old = self.cat
@@ -506,6 +561,53 @@ class Commentator:
     def _check_night(self):
         if 1 <= self.hour() < 5:
             self._fire("night")
+
+    # --- свободный режим, обои ---
+    def _free_delay(self):
+        minutes = FREE_MIN_MINUTES + (FREE_MAX_MINUTES - FREE_MIN_MINUTES) * self.rand()
+        return minutes * 60 * (self.learn.tempo if self.learn else 1.0)
+
+    def _check_free(self, now):
+        """Свободный режим: раз в несколько минут сказать что угодно о том, чем ты занят, или об обоях."""
+        if self.next_free is None:
+            self.next_free = now + self._free_delay()
+            return
+        if now < self.next_free:
+            return
+        self.next_free = now + self._free_delay()
+        if self.looker and self.cfg.get("commentary_wallpaper") and self.rand() < WALLPAPER_SHARE:
+            self._look_async("wallpaper", "wallpaper", {}, fallback=False)
+            return
+        running = self.book.running()
+        act = freestyle.activity_text(self.cat, self.vtitle if self.cat == "video" else None,
+                                      running[0] if running else None)
+        self._fire("free", {"act": act})
+
+    def _check_wallpaper(self, now):
+        """Обои сменились — отреагировать (если включено "commentary_wallpaper")."""
+        if not self.cfg.get("commentary_wallpaper") or now - self.wall_checked < WALL_CHECK_SECONDS:
+            return
+        self.wall_checked = now
+        sig = self.wall()
+        if sig and self.wall_sig and sig != self.wall_sig:
+            self._look_async("wallpaper", "wallpaper", {}, fallback=True)
+        if sig:
+            self.wall_sig = sig
+
+    def _look_async(self, situation, kind, detail, fallback):
+        """Описание картинки может занять секунды (модель с «глазами»), поэтому ждём его в отдельном потоке.
+        fallback — сказать что-то и без описания (например, «сменил обои»)."""
+        def job():
+            desc = None
+            try:
+                desc = self.looker(kind) if self.looker else None
+            except Exception:
+                log.exception("Комментарии: не удалось посмотреть (%s)", kind)
+            if desc:
+                self._fire(situation, {**detail, "what": desc})
+            elif fallback:
+                self._fire(situation, detail)
+        self.spawn(job)
 
     # --- поток ---
     def start(self):

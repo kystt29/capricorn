@@ -19,6 +19,7 @@ import psutil
 
 import automation
 import commentary
+import freestyle
 import games
 import learning
 import media
@@ -962,6 +963,10 @@ class Actions:
         persona.TOPIC_PROVIDERS.append(self.games.chatter_topics)
         self.routes = [
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
+            (freestyle.ANYTIME_RE, self.anytime_toggle),    # раньше «комментируй» / «не комментируй»
+            (freestyle.PROFANITY_RE, self.profanity_toggle),
+            (freestyle.WALLPAPER_RE, lambda c, m: self.look_cmd("wallpaper")),
+            (freestyle.SCREEN_RE, lambda c, m: self.look_cmd("screen")),
             (commentary.TOGGLE_RE, self.commentary_toggle),
             (learning.LIKE_RE, self.feedback_like),        # «ха-ха», «в точку» — сразу после реплики Капри
             (learning.DISLIKE_RE, self.feedback_dislike),  # «не смешно», «перебор»
@@ -1274,6 +1279,35 @@ class Actions:
         off = commentary.toggle_wants_off(c)
         return Reply(line("commentary_off" if off else "commentary_on"), "commentary:" + ("off" if off else "on"))
 
+    def anytime_toggle(self, c, m):
+        """«комментируй всё» / «выключи свободный режим» (само переключение делает main)."""
+        off = bool(re.search(freestyle.ANYTIME_OFF, c))
+        return Reply(line("anytime_off" if off else "anytime_on"), "anytime:" + ("off" if off else "on"))
+
+    def profanity_toggle(self, c, m):
+        """«ругайся» / «не матерись» (само переключение делает main)."""
+        off = bool(re.search(freestyle.PROFANITY_OFF, c))
+        return Reply(line("profanity_off" if off else "profanity_on"), "profanity:" + ("off" if off else "on"))
+
+    def look_cmd(self, kind):
+        """«прокомментируй обои» / «прокомментируй экран»: посмотреть (локальная модель с «глазами») и сказать своё.
+        По просьбе — всегда, независимо от настроек комментариев."""
+        if not self.local:
+            return Reply(line("look_no_model"))
+        try:
+            what = freestyle.describe(self.local, kind)
+        except freestyle.NoVision:
+            return Reply(line("look_no_model"))
+        except Exception:
+            log.exception("Не смогла посмотреть (%s)", kind)
+            return Reply(line("look_fail"))
+        if not what:
+            return Reply(line("look_fail"))
+        detail = {"what": what}
+        if self.commentator:
+            return Reply(self.commentator.render(kind, detail, self.local.quip, line))
+        return Reply(commentary.compose(kind, detail, self.local.quip, line, rude=bool(self.cfg.get("profanity"))))
+
     def _outcome_cmd(self, kind):
         """«я слил» / «ура, прошёл»: стёб, подбадривание или похвала — по тому, что заходит. Если подколки выключены,
         фраза идёт дальше, как обычный разговор."""
@@ -1288,7 +1322,7 @@ class Actions:
             if found:
                 return Reply(self.commentator.render(found[0], found[1], quip, line))
             return None
-        return Reply(commentary.compose(kind, detail, quip, line))
+        return Reply(commentary.compose(kind, detail, quip, line, rude=bool(self.cfg.get("profanity"))))
 
     def loss_cmd(self, c, m):
         return self._outcome_cmd("loss")

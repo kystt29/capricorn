@@ -41,6 +41,7 @@ try:
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
     from commentary import TOGGLE_RE, Commentator, heard_laugh, heard_outcome
+    from freestyle import ANYTIME_RE, PROFANITY_CONTEXT, PROFANITY_RE, NoVision, describe
     from games import GameTracker
     from learning import Learning
     from local_ai import LocalAI
@@ -75,6 +76,9 @@ DEFAULTS = {
     "commentary": True,      # комментировать, что ты делаешь, и стебать за проигрыши
     "commentary_minutes": 6,   # не чаще раза в столько минут (комментарии про игры — вне этого лимита);
                                # дальше Капри сама подстраивает темп под твою реакцию
+    "commentary_anytime": False,  # «свободный режим»: комментировать что угодно и когда угодно (даже поверх игр)
+    "commentary_wallpaper": False,  # смотреть на обои и реагировать на их смену (нужна модель с «глазами» в Ollama)
+    "profanity": False,      # мат в подколках: включается голосом «Капри, ругайся» или галочкой в трее
     "commentary_titles": True,  # реагировать на название видео (его видит только локальная нейросеть)
     "react_to_voice": False,   # реагировать на «слили!» и «ура!» без имени, пока идёт игра (слушает фон)
     "screen_reactions": False,  # замечать надписи победы и поражения на экране в играх (screen.py, экспериментально)
@@ -287,8 +291,9 @@ class Capri(QObject):
         self.learning = Learning(os.path.join(BASE, "learning.json"))
         CONTEXT_PROVIDERS.append(self.learning.habits_summary)   # нейросеть знает твои привычки
         TOPIC_PROVIDERS.append(self.learning.habit_topics)
+        CONTEXT_PROVIDERS.append(lambda: PROFANITY_CONTEXT if self.cfg.get("profanity") else "")
         self.commentator = Commentator(self.actions.games, self._on_comment, self._can_comment, self.cfg,
-                                       learn=self.learning)
+                                       learn=self.learning, looker=self._look)
         self.actions.commentator = self.commentator
         self.screen = ScreenWatcher(self.actions.games, self._on_screen_outcome, self.cfg)
         self.speaker = Speaker(cfg)
@@ -332,6 +337,20 @@ class Capri(QObject):
             self.game_tracker.start()
         self.commentator.start()  # сам проверяет, включены ли комментарии
         self.screen.start()       # сам проверяет, включены ли реакции по экрану и идёт ли игра
+
+    def _look(self, kind):
+        """Описание обоев или экрана для наблюдателя (его поток); None, если посмотреть нечем."""
+        if not self.local:
+            return None
+        try:
+            return describe(self.local, kind)
+        except NoVision:
+            if not getattr(self, "_novision_logged", False):
+                self._novision_logged = True
+                log.info("Обои и экран: в Ollama нет модели с «глазами» (например: ollama pull qwen2.5vl:3b)")
+        except Exception:
+            log.exception("Не удалось посмотреть (%s)", kind)
+        return None
 
     def _on_screen_outcome(self, kind):
         """Надпись победы или поражения на экране в игре (поток наблюдателя за экраном)."""
@@ -399,7 +418,7 @@ class Capri(QObject):
             if now < due:
                 continue
             quiet = now - self.last_activity > 120 and self.jobs.empty() and not self.speaking
-            if quiet and not fullscreen_app_active():
+            if quiet and (self.cfg.get("commentary_anytime") or not fullscreen_app_active()):
                 self.jobs.put(("chatter",))
                 due = now + next_delay()
             else:
@@ -490,7 +509,8 @@ class Capri(QObject):
             return
         cmd = self.strip_wake(text) if woke else text
         # «перестань меня стебать» — не «стоп», а настройка комментариев
-        if STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3 and not re.search(TOGGLE_RE, cmd.lower()):
+        if (STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3
+                and not re.search(f"{TOGGLE_RE}|{PROFANITY_RE}|{ANYTIME_RE}", cmd.lower().replace("ё", "е"))):
             # «Капри, стоп» — замолчать, остановить автопрокрутку и слушать дальше
             self.awake_until = now + self.cfg["listen_window_seconds"]
             if self.actions.stop_background():
@@ -527,6 +547,20 @@ class Capri(QObject):
         self.cfg["commentary"] = bool(on)
         save_setting("commentary", bool(on))
         log.info("Комментарии: %s", "включены" if on else "выключены")
+
+    def set_profanity(self, on):
+        """Галочка в трее и «Капри, ругайся» / «не матерись»."""
+        self.cfg["profanity"] = bool(on)
+        save_setting("profanity", bool(on))
+        log.info("Мат: %s", "включён" if on else "выключен")
+
+    def set_anytime(self, on):
+        """Галочка в трее и «Капри, комментируй всё»: свободный режим. Включая его, включаем и комментарии."""
+        self.cfg["commentary_anytime"] = bool(on)
+        save_setting("commentary_anytime", bool(on))
+        if on and not self.cfg.get("commentary", True):
+            self.set_commentary(True)
+        log.info("Свободный режим: %s", "включён" if on else "выключен")
 
     def set_screen_reactions(self, on):
         """Галочка в трее: замечать ли надписи победы и поражения на экране в играх."""
@@ -569,7 +603,8 @@ class Capri(QObject):
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
                     "user_name_mode", "user_name", "user_gender", "commentary", "commentary_minutes",
-                    "react_to_voice", "commentary_titles", "screen_reactions", "steam_confirm",
+                    "react_to_voice", "commentary_titles", "screen_reactions", "commentary_anytime",
+                    "commentary_wallpaper", "profanity", "steam_confirm",
                     "steam_friends", "steam_path"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
@@ -725,6 +760,10 @@ class Capri(QObject):
             reply = self.mic_command(reply.action)
         elif reply is not None and reply.action and reply.action.startswith("commentary:"):
             self.set_commentary(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("profanity:"):
+            self.set_profanity(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("anytime:"):
+            self.set_anytime(reply.action.endswith("on"))
         if reply is None:
             if self.cfg.get("enable_ai") and self.ai.available:
                 reply = Reply(self.ai.ask(cmd), "answer")
@@ -964,10 +1003,21 @@ def main():
             screen_act.toggled.connect(capri.set_screen_reactions)
             menu.addAction(screen_act)
 
-            def sync_search(a=search_act, b=chatter_act, d=comment_act, e=screen_act):
+            # свободный режим и мат
+            anytime_act = QAction("Свободный режим: комментировать всё", menu)
+            anytime_act.setCheckable(True)
+            anytime_act.toggled.connect(capri.set_anytime)
+            menu.addAction(anytime_act)
+            rude_act = QAction("Мат в подколках", menu)
+            rude_act.setCheckable(True)
+            rude_act.toggled.connect(capri.set_profanity)
+            menu.addAction(rude_act)
+
+            def sync_search(a=search_act, b=chatter_act, d=comment_act, e=screen_act, f=anytime_act, g=rude_act):
                 capri.reload_config_if_changed(speak=False)  # могли поменять в config.json руками
                 for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True),
-                                          (d, "commentary", True), (e, "screen_reactions", False)):
+                                          (d, "commentary", True), (e, "screen_reactions", False),
+                                          (f, "commentary_anytime", False), (g, "profanity", False)):
                     act.blockSignals(True)
                     act.setChecked(bool(capri.cfg.get(key, default)))
                     act.blockSignals(False)
