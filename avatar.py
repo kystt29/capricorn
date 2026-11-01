@@ -470,6 +470,7 @@ class Avatar(QWidget):
         self.anims = load_anims(os.path.join(assets_dir, "anim"))
         self.anim = None             # имя проигрываемой анимации
         self.anim_start = 0.0
+        self.fx = effects.Player(time.time)   # процедурные анимации (прыжок, дрожь…)
         self.anim_loop = False
 
         self.frame = canvas(W, H)
