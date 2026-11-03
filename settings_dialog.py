@@ -5,8 +5,8 @@ import re
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QSpinBox, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QScrollArea, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from entries_dialog import STYLE
@@ -19,41 +19,98 @@ class SettingsDialog(QDialog):
         self.cfg = capri.cfg
         self.setWindowTitle("Капри — настройки")
         self.setStyleSheet(STYLE + """
-        QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {
-            background: #120818; color: #ffd2e1; border: 1px solid #5a2a50; padding: 3px;
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QTableWidget {
+            background: #120818; color: #ffd2e1;
+            border: 1px solid #5a2a50; border-radius: 8px;
+            padding: 6px 8px; selection-background-color: #ff2260;
         }
-        QCheckBox { color: #ffd2e1; }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QTextEdit:focus {
+            border: 1px solid #ff2260;
+        }
+        QTabBar::tab {
+            min-width: 92px; padding: 8px 12px; margin-right: 4px;
+            border-radius: 10px 10px 0 0;
+        }
+        QTabBar::tab:selected { background: #ff2260; color: #0a0612; }
+        QGroupBox {
+            border: 1px solid #5a2a50; border-radius: 12px;
+            margin-top: 10px; padding: 10px; color: #28ff96;
+            font-weight: bold;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+        QScrollArea { border: none; background: transparent; }
+        QScrollBar:vertical { background: #0a0612; width: 10px; margin: 0; }
+        QScrollBar::handle:vertical { background: #5a2a50; border-radius: 5px; min-height: 20px; }
+        QScrollBar::handle:vertical:hover { background: #ff2260; }
+        QPushButton {
+            border-radius: 10px; padding: 8px 14px;
+        }
+        QPushButton:hover { background: #ff2260; color: #0a0612; }
+        QCheckBox { color: #ffd2e1; spacing: 8px; }
+        QLabel { color: #ffd2e1; }
         """)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._basic_tab(), "Основное")
-        self.tabs.addTab(self._voice_tab(), "Голос")
-        self.tabs.addTab(self._mic_tab(), "Микрофон")
-        self.tabs.addTab(self._user_tab(), "Пользователь")
-        self.tabs.addTab(self._ai_tab(), "ИИ")
-        self.tabs.addTab(self._lists_tab(), "Списки")
-        self.tabs.addTab(self._scenarios_tab(), "Сценарии")
-        self.tabs.addTab(self._raw_tab(), "config.json")
+        tabs = [
+            ("⚙ Основное", self._basic_tab(), "Основные параметры поведения и wake-words."),
+            ("🔊 Голос", self._voice_tab(), "Голос, TTS, скорость и высота."),
+            ("🎤 Микрофон", self._mic_tab(), "Устройство ввода и чувствительность."),
+            ("👤 Пользователь", self._user_tab(), "Как Капри вас называет и в каком роде."),
+            ("🤖 ИИ", self._ai_tab(), "Провайдеры, модели, ключи и локальный ИИ."),
+            ("📋 Списки", self._lists_tab(), "Сайты, программы и свои ответы."),
+            ("🧩 Сценарии", self._scenarios_tab(), "Наборы действий по одному имени."),
+            ("📝 config.json", self._raw_tab(), "Ручной JSON-редактор."),
+        ]
+        for label, widget, tip in tabs:
+            self.tabs.addTab(self._wrap(widget), label)
+            self.tabs.setTabToolTip(self.tabs.count() - 1, tip)
 
         apply_btn = QPushButton("Применить")
         close_btn = QPushButton("Закрыть")
+        reset_btn = QPushButton("Сбросить вкладку")
         apply_btn.clicked.connect(self.apply)
         close_btn.clicked.connect(self.close)
+        reset_btn.clicked.connect(self._discard_tab_changes)
         btn_row = QHBoxLayout()
+        btn_row.addWidget(reset_btn)
         btn_row.addStretch()
+        self.status_label = QLabel("Готово.")
+        self.status_label.setStyleSheet("color: #28ff96;")
+        btn_row.addWidget(self.status_label)
         btn_row.addWidget(apply_btn)
         btn_row.addWidget(close_btn)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(self.tabs)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+        lay.addWidget(self.tabs, 1)
         lay.addLayout(btn_row)
-        self.resize(620, 520)
+        self.resize(760, 620)
+        self.setMinimumSize(680, 560)
 
     # ---------- helpers ----------
+    def _wrap(self, widget):
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 8, 8, 8)
+        content_layout.addWidget(widget)
+        area.setWidget(content)
+        area.setStyleSheet("QScrollArea { background: transparent; }")
+        return area
+
     def _title(self, text):
         lbl = QLabel(text)
         lbl.setStyleSheet("color: #28ff96; font-weight: bold;")
         return lbl
+
+    def _discard_tab_changes(self):
+        self.capri.reload_config_if_changed(speak=False)
+        dlg = SettingsDialog(self.capri)
+        dlg.show()
+        self.close()
 
     def _check(self, caption, value):
         cb = QCheckBox(caption)
@@ -642,6 +699,8 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
             from PySide6.QtWidgets import QMessageBox
+            self.status_label.setText("Применено. Часть настроек вступит после перезапуска.")
+            self.status_label.setStyleSheet("color: #28ff96;")
             QMessageBox.information(self, "Капри", "Настройки применены. Некоторые из них вступят в силу после перезапуска Капри.")
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
