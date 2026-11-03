@@ -1063,6 +1063,64 @@ class Actions:
             if re.match(r"^(никак\w*|ни одно|ни то|отмена|не надо|нет|ничего)\b", c):
                 return Reply(line("cancel"))
             # ответ не про выбор — значит, это новая команда
+        # --- сценарии: несколько команд по одному имени ---
+        scen_forget = re.match(r"^забудь\s+сценарий\s+(?P<name>.+)$", c)
+        if scen_forget:
+            name = scen_forget.group("name").strip()
+            if self.cfg.get("scenarios", {}).pop(name, None) is not None:
+                try:
+                    import main as _m
+                    _m.save_setting("scenarios", self.cfg.get("scenarios", {}))
+                except Exception:
+                    pass
+                return Reply(f"Забыла сценарий «{name}».")
+            return Reply(f"Сценария «{name}» не было.")
+        # Permite que el usuario enseñe sin dos puntos: «сценарий trabajo bloque nota vscode».
+        scen_teach2 = re.match(r"^(?:научи\s+)?сценарий\s+(?P<name>\S+)\s+(?P<items>.+)$", c)
+        if scen_teach2:
+            name = scen_teach2.group("name").strip().strip(":-")
+            raw_items = scen_teach2.group("items").strip().lstrip(":-").strip()
+            items = [x.strip() for x in raw_items.replace(" и ", ",").split(",") if x.strip()]
+            if not items or len(items) == 1 and " " in items[0]:
+                items = [x for x in raw_items.split() if x.strip()]
+            if items:
+                self.cfg.setdefault("scenarios", {})[name] = items
+                try:
+                    import main as _m
+                    _m.save_setting("scenarios", self.cfg["scenarios"])
+                except Exception:
+                    pass
+                return Reply(f"Запомнила сценарий «{name}»: {', '.join(items)}.")
+
+        scen_list = re.match(r"^(?:покажи\s+|мои\s+)?сценари(?:й|и)$", c)
+        if scen_list:
+            names = sorted(self.cfg.get("scenarios", {}).keys())
+            if not names:
+                return Reply("Сценариев пока нет. Научи: «сценарий работа: браузер, вс код, телеграм».")
+            return Reply("Сценарии: " + ", ".join(names) + ".")
+
+        scen_run = re.match(r"^(?:запусти\s+)?сценарий\s+(?P<name>.+)$", c)
+        if scen_run:
+            requested = scen_run.group("name").strip()
+            items = self.cfg.get("scenarios", {}).get(requested)
+            if items is None and " " in requested:
+                first = requested.split()[0]
+                items = self.cfg.get("scenarios", {}).get(first)
+                requested = first if items is not None else requested
+            if items:
+                notes = []
+                for item in items:
+                    try:
+                        r = self.handle_one(f"открой {item}")
+                        if r and r.text:
+                            notes.append(r.text)
+                    except Exception:
+                        pass
+                return Reply(f"Запускаю сценарий «{requested}»: {', '.join(notes) if notes else 'готово'}.")
+            return Reply(f"Сценария «{requested}» не знаю. Научи: «сценарий {requested}: браузер, вс код».")
+
+        custom = self.custom_reply(c)  # своя фраза целиком — не делим её на цепочку команд
+
         custom = self.custom_reply(c)  # своя фраза целиком — не делим её на цепочку команд
         if custom:
             return custom

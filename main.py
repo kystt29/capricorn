@@ -54,6 +54,9 @@ except ImportError as e:
 
 DEFAULTS = {
     "enable_ai": False,
+    "scenarios": {},
+    "cache_cleanup_on_start": False,
+    "cache_cleanup_days": 14,
     "ai_provider": "anthropic",
     "ai_api_key": "",
     "ai_base_url": "",
@@ -300,6 +303,8 @@ class Capri(QObject):
                                      gain=float(self.cfg.get("mic_gain", 1.0)),
                                      sensitivity=int(self.cfg.get("mic_sensitivity", 100)))
             self.listener.start()
+            if self.cfg.get("cache_cleanup_on_start"):
+                threading.Thread(target=lambda: self.cleanup_cache_and_logs(speak=False), daemon=True).start()
         else:
             self.jobs.put(("say", line("no_model")))
             return
@@ -462,6 +467,28 @@ class Capri(QObject):
         log.info("История ИИ очищена")
         self.jobs.put(("say", "История ИИ очищена."))
 
+    def cleanup_cache_and_logs(self, speak=True):
+        """Удалить старые файлы TTS-кеша и обрезать журнал."""
+        removed = 0
+        try:
+            from voice import clear_tts_cache
+            removed = clear_tts_cache(self.cfg.get("cache_cleanup_days", 14))
+        except Exception:
+            log.exception("Очистка кеша не удалась")
+        try:
+            log_path = os.path.join(BASE, "capri.log")
+            if os.path.isfile(log_path):
+                with open(log_path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                if len(lines) > 5000:
+                    with open(log_path, "w", encoding="utf-8") as f:
+                        f.write("\\n".join(lines[-5000:]) + "\\n")
+        except Exception:
+            log.exception("Обрезка журнала не удалась")
+        if speak:
+            self.jobs.put(("say", f"Очистила кеш: {removed} файлов, журнал обрезан."))
+        log.info("Очистка завершена, удалено: %d", removed)
+
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
         self.cfg["chatter"] = bool(on)
@@ -501,7 +528,7 @@ class Capri(QObject):
             return
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
-                    "user_name_mode", "user_name", "user_gender"):
+                    "scenarios", "user_name_mode", "user_name", "user_gender"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)
@@ -808,6 +835,8 @@ def main():
                        ("Настройки…", open_settings),
                       ("Как ко мне обращаться…", open_profile),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
+("Настройки микрофона Windows", lambda: os.startfile("ms-settings:privacy-microphone")),
+("Очистить кэш и логи", lambda: capri.cleanup_cache_and_logs()),
                       ("Спрятать", avatar.vanish),
                       ("MIC", None),
                       ("SEARCH", None),

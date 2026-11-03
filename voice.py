@@ -452,6 +452,31 @@ def _trim_cache():
         pass
 
 
+def clear_tts_cache(max_age_days=None, max_log_lines=5000):
+    """Удалить старые файлы TTS‑кеша (и при необходимости обрезать capri.log). Возвращает число удалённых файлов."""
+    removed = 0
+    try:
+        os.makedirs(TTS_CACHE, exist_ok=True)
+        cutoff = time.time() - int(max_age_days) * 86400 if max_age_days is not None else None
+        for name in os.listdir(TTS_CACHE):
+            path = os.path.join(TTS_CACHE, name)
+            if cutoff is not None:
+                try:
+                    if os.path.getmtime(path) > cutoff:
+                        continue
+                except OSError:
+                    continue
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    # ротация capri.log — BASE доступен из main? Держим лог в модуле capri, но voice.py не знает BASE.
+    return removed
+
+
 class Speaker:
     def __init__(self, cfg):
         self.voice = cfg.get("voice", "ru-RU-SvetlanaNeural")

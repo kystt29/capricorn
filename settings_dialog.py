@@ -5,8 +5,8 @@ import re
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QTabWidget, QTextEdit,
-    QVBoxLayout, QWidget,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QSpinBox, QTabWidget,
+    QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from entries_dialog import STYLE
@@ -32,6 +32,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._user_tab(), "Пользователь")
         self.tabs.addTab(self._ai_tab(), "ИИ")
         self.tabs.addTab(self._lists_tab(), "Списки")
+        self.tabs.addTab(self._scenarios_tab(), "Сценарии")
         self.tabs.addTab(self._raw_tab(), "config.json")
 
         apply_btn = QPushButton("Применить")
@@ -95,14 +96,17 @@ class SettingsDialog(QDialog):
         self.barge_in = self._check("Можно перебивать голосом", cfg.get("barge_in", True))
         self.use_google_stt = self._check("Уточнять фразу через Google", cfg.get("use_google_stt", True))
         self.type_press_enter = self._check("Отправлять сообщение Enter после «напиши»", cfg.get("type_press_enter", True))
+        self.cache_cleanup_on_start = self._check("Очищать кеш/логи при запуске", cfg.get("cache_cleanup_on_start", False))
+        self.cache_cleanup_days = self._spin(1, 365, cfg.get("cache_cleanup_days", 14), " дн")
 
         form.addRow("Слова-обращения (через запятую):", self.wake_words)
         form.addRow("Время слушания после появления:", self.listen_seconds)
         form.addRow("Время ожидания следующей команды:", self.followup_seconds)
         form.addRow("Исчезать через:", self.hide_after)
         for c in (self.greet_on_start, self.search_when_unsure, self.chatter, self.teleport_on_answer,
-                  self.barge_in, self.use_google_stt, self.type_press_enter):
+                  self.barge_in, self.use_google_stt, self.type_press_enter, self.cache_cleanup_on_start):
             form.addRow(c)
+        form.addRow("Очищать кеш старше:", self.cache_cleanup_days)
         form.addRow("Свои появления — от/до минут:", self._pair(self.chatter_min, self.chatter_max))
         form.addRow("Вероятность прогулки (0..1):", self.roam_chance)
         hint = QLabel("Большинство базовых настроек применяются после перезапуска Капри.")
@@ -347,6 +351,46 @@ class SettingsDialog(QDialog):
             QApplication.restoreOverrideCursor()
         QMessageBox.information(self, "Тест ИИ", f"Ответ: {answer}")
 
+    def _scenarios_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel("Сценарий: название + что запускать (имена из сайтов/программ, через запятую). "
+                      "Пример: «работа» | «браузер, вс код, телеграм». Голос: «Капри, сценарий работа».")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        self.scenarios_table = QTableWidget(0, 2)
+        self.scenarios_table.setHorizontalHeaderLabels(["Название сценария", "Что запускать (через запятую)"])
+        self.scenarios_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.scenarios_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.scenarios_table, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Добавить")
+        remove = QPushButton("Удалить")
+        add.clicked.connect(self._add_scenario)
+        remove.clicked.connect(self._remove_scenario)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch()
+        lay.addLayout(row)
+        # load initial data
+        for name, items in sorted((self.cfg.get("scenarios") or {}).items()):
+            r = self.scenarios_table.rowCount()
+            self.scenarios_table.insertRow(r)
+            self.scenarios_table.setItem(r, 0, QTableWidgetItem(str(name)))
+            self.scenarios_table.setItem(r, 1, QTableWidgetItem(", ".join(items) if isinstance(items, list) else str(items)))
+        return w
+
+    def _add_scenario(self):
+        r = self.scenarios_table.rowCount()
+        self.scenarios_table.insertRow(r)
+        self.scenarios_table.setItem(r, 0, QTableWidgetItem(""))
+        self.scenarios_table.setItem(r, 1, QTableWidgetItem(""))
+
+    def _remove_scenario(self):
+        r = self.scenarios_table.currentRow()
+        if r >= 0:
+            self.scenarios_table.removeRow(r)
+
     def _lists_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -427,6 +471,8 @@ class SettingsDialog(QDialog):
         updates["barge_in"] = bool(self.barge_in.isChecked())
         updates["use_google_stt"] = bool(self.use_google_stt.isChecked())
         updates["type_press_enter"] = bool(self.type_press_enter.isChecked())
+        updates["cache_cleanup_on_start"] = bool(self.cache_cleanup_on_start.isChecked())
+        updates["cache_cleanup_days"] = int(self.cache_cleanup_days.value())
 
         voice_keys = ["voice", "tts_engine", "voice_rate", "voice_pitch", "voice_shift", "voice_lively", "voice_fx",
                       "voice_volume", "browser"]
@@ -455,6 +501,16 @@ class SettingsDialog(QDialog):
         user_mode = self.user_name_mode.currentData() or "none"
         user_name = self.user_name.text().strip()
         user_gender = self.user_gender.currentData() or "male"
+
+        scenarios = {}
+        for r in range(self.scenarios_table.rowCount()):
+            a = self.scenarios_table.item(r, 0)
+            b = self.scenarios_table.item(r, 1)
+            name = a.text().strip() if a else ""
+            text = b.text().strip() if b else ""
+            if name and text:
+                scenarios[name] = [x.strip() for x in text.replace(";", ",").split(",") if x.strip()]
+        updates["scenarios"] = scenarios
 
         return updates, user_mode, user_name, user_gender
 
