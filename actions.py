@@ -1033,6 +1033,10 @@ class Actions:
              r"(все )?(процесс\w*|задачу|задачи)|кильни|килльни|грохни|прибей) (?P<t>.+)$", self.kill_process),
             (r"что (сейчас )?(грузит|нагружает|жрет|ест|тормозит)|(какие|какой) процесс\w* (грузят|нагружают|жрут|"
              r"тормозят)|самые (тяжелые|прожорливые) процессы", self.top_processes),
+            (r"(батарея|заряд (аккумулятора|батареи)|аккумулятор)", self.battery),
+            (r"(свободное место|свободно на диске|место на диске|проверь диск|проверка диска|что на диске|состояние диска|проверь c)", self.disk_space),
+            (r"(скорость интернета|скорость сети|пинг|проверь интернет|проверь сеть|интернет скорость)", self.network_speed),
+            (r"(игровой режим|режим игры|игровой профиль|обычный режим|выключить игровой режим)", self.game_mode),
             (r"^(закрой|заверши|выключи|убей) (?P<t>.+)$", self.close),
             (r"который час|сколько времени|сколько сейчас времени|время сейчас", self.time),
             (r"какое (сегодня )?число|какая (сегодня )?дата|какой сегодня день", self.date),
@@ -2016,6 +2020,92 @@ class Actions:
         path = os.path.join(folder, f"screen_{datetime.datetime.now():%Y%m%d_%H%M%S}.png")
         ImageGrab.grab(all_screens=True).save(path)
         return Reply(line("screenshot"))
+
+    def battery(self, c, m):
+        try:
+            import psutil
+        except Exception:
+            return Reply(line("error", e="нет psutil"))
+        b = psutil.sensors_battery()
+        if b is None:
+            return Reply(line("battery_none"))
+        pct = round(b.percent)
+        state = "заряжается" if b.power_plugged else "разряжается"
+        secs = b.secsleft if b.secsleft and b.secsleft > 0 else None
+        extra = (", осталось примерно " + str(secs // 60) + " мин.") if secs else ""
+        if pct < 20:
+            text = line("battery_low", pct=pct)
+        elif pct > 80:
+            text = line("battery_high", pct=pct)
+        else:
+            text = line("battery_mid", pct=pct)
+        return Reply(f"{text} Сейчас {state}{extra}.")
+
+    def disk_space(self, c, m):
+        try:
+            import psutil
+        except Exception:
+            return Reply(line("error", e="нет psutil"))
+        parts = []
+        stats = []
+        for d in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(d.mountpoint)
+            except (PermissionError, OSError):
+                continue
+            total, used, free = u.total // (1024**3), u.used // (1024**3), u.free // (1024**3)
+            pct_free = (free / total * 100) if total else 100
+            parts.append(d.device + ": свободно " + str(free) + " из " + str(total) + " ГБ (занято " + str(used) + " ГБ).")
+            stats.append((d.device, free, total, pct_free))
+        if not parts:
+            return Reply("Не удалось прочитать информацию о дисках.")
+        primary = next((x for x in stats if x[0].upper().startswith("C:")), (stats[0] if stats else None))
+        free, total, pct_free = (primary[1], primary[2], primary[3]) if primary else (0, 0, 100)
+        if pct_free < 8:
+            text = line("disk_critical", free=free, total=total)
+        elif pct_free < 25:
+            text = line("disk_warn", free=free, total=total)
+        else:
+            text = line("disk_ok", free=free, total=total)
+        return Reply(text + " " + " ".join(parts))
+
+    def network_speed(self, c, m):
+        import time
+        import urllib.request
+        start = time.time()
+        try:
+            urllib.request.urlopen("https://www.google.com", timeout=5)
+            ping_ms = (time.time() - start) * 1000
+        except Exception:
+            return Reply(line("net_offline"))
+        try:
+            t0 = time.time()
+            with urllib.request.urlopen("http://speed.cloudflare.com/__down?bytes=1000000", timeout=15) as r:
+                data = r.read()
+            elapsed = max(time.time() - t0, 0.01)
+            mbps = len(data) * 8 / elapsed / 1_000_000
+            if ping_ms > 350 or mbps < 5:
+                return Reply(line("net_slow", ping=round(ping_ms), speed=round(mbps, 1)))
+            return Reply(line("net_fast", ping=round(ping_ms), speed=round(mbps, 1)))
+        except Exception:
+            return Reply(line("net_offline") if False else "Интернет есть: пинг " + str(round(ping_ms)) + " мс, но скорость не измерилась.")
+
+    def game_mode(self, c, m):
+        if re.search(r"(обычн|выкл|сними|отключи).*(режим)|(режим).*(выкл|обычн|сними|отключи)", c):
+            self.cfg["chatter"] = True
+            try:
+                import main as _m
+                _m.save_setting("chatter", True)
+            except Exception:
+                pass
+            return Reply(line("game_mode_off"))
+        self.cfg["chatter"] = False
+        try:
+            import main as _m
+            _m.save_setting("chatter", False)
+        except Exception:
+            pass
+        return Reply(line("game_mode_on"))
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):
