@@ -54,6 +54,9 @@ except ImportError as e:
 
 DEFAULTS = {
     "enable_ai": False,
+    "ai_provider": "anthropic",
+    "ai_api_key": "",
+    "ai_base_url": "",
     "local_ai": True,
     "local_model": "qwen3:8b",
     "barge_in": True,
@@ -777,11 +780,17 @@ def main():
         from profile_dialog import ProfileDialog
         show_window("profile", lambda: ProfileDialog(capri))
 
+    def open_settings():
+        from settings_dialog import SettingsDialog
+        capri.reload_config_if_changed(speak=False)
+        show_window("settings", lambda: SettingsDialog(capri))
+
     menu = QMenu()
     for title, fn in (("Позвать Капри", capri.call_from_click),
                       ("Замолчать", capri.interrupt),
                       ("Написать команду…", ask_text),
                       ("Мои сайты, программы и ответы…", open_entries),
+                      ("Настройки…", open_settings),
                       ("Как ко мне обращаться…", open_profile),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
                       ("Спрятать", avatar.vanish),
