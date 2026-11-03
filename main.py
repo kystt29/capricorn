@@ -448,6 +448,20 @@ class Capri(QObject):
         apply_user(self.cfg)
         log.info("Обращение: %s, %s", user_display_name(self.cfg) or "без имени", gender)
 
+    def clear_ai_history(self):
+        """Очистить историю разговора у активных ИИ (Cloud + локальный)."""
+        try:
+            self.ai.history = []
+        except Exception:
+            pass
+        if self.local:
+            try:
+                self.local.history = []
+            except Exception:
+                pass
+        log.info("История ИИ очищена")
+        self.jobs.put(("say", "История ИИ очищена."))
+
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
         self.cfg["chatter"] = bool(on)
@@ -790,7 +804,8 @@ def main():
                       ("Замолчать", capri.interrupt),
                       ("Написать команду…", ask_text),
                       ("Мои сайты, программы и ответы…", open_entries),
-                      ("Настройки…", open_settings),
+                      ("Очистить историю ИИ", lambda: capri.clear_ai_history()),
+                       ("Настройки…", open_settings),
                       ("Как ко мне обращаться…", open_profile),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
                       ("Спрятать", avatar.vanish),

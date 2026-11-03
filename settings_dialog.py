@@ -248,7 +248,14 @@ class SettingsDialog(QDialog):
         self.ai_api_key = QLineEdit(cfg.get("ai_api_key") or cfg.get("anthropic_api_key", ""))
         self.ai_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.ai_base_url = QLineEdit(cfg.get("ai_base_url", "") or PROVIDERS.get(current_provider, ("", "", ""))[1])
-        self.ai_model = QLineEdit(cfg.get("model", PROVIDERS.get(current_provider, ("", "", ""))[2]))
+        self.ai_model = QComboBox()
+        self.ai_model.setEditable(True)
+        _model = (cfg.get("model") or PROVIDERS.get(current_provider, ("", "", ""))[2] or "").strip()
+        if _model:
+            self.ai_model.addItem(_model)
+        self.ai_model.setCurrentText(_model)
+        self.ai_status = QLabel("Проверка ИИ не выполнялась.")
+        self.ai_status.setWordWrap(True)
         self.local_ai = self._check("Включить локальный ИИ (Ollama)", cfg.get("local_ai", True))
         self.local_model = QLineEdit(cfg.get("local_model", "qwen3:8b"))
 
@@ -261,6 +268,15 @@ class SettingsDialog(QDialog):
         form.addRow("Модель:", self.ai_model)
         form.addRow(self.local_ai)
         form.addRow("Модель Ollama:", self.local_model)
+        row_models = QHBoxLayout()
+        refresh = QPushButton("Обновить модели")
+        refresh.clicked.connect(self._refresh_ai_models)
+        test = QPushButton("Тест ИИ")
+        test.clicked.connect(self._test_ai)
+        row_models.addWidget(refresh)
+        row_models.addWidget(test)
+        form.addRow("Список моделей:", row_models)
+        form.addRow("Статус ИИ:", self.ai_status)
         hint = QLabel("Anthropic поддерживает веб-поиск; остальные работают как обычный чат. Свой адрес можно указать при «Свой URL». "
                       "Переключение локального ИИ/облачного лучше подтверждать перезапуском.")
         hint.setWordWrap(True)
@@ -277,9 +293,59 @@ class SettingsDialog(QDialog):
         presets = {v[1] for v in PROVIDERS.values()}
         if not old or old in presets:
             self.ai_base_url.setText(base)
-        if not self.ai_model.text().strip() or self.ai_model.text().strip() in presets or self.ai_model.text().strip() in ("claude-opus-5-5",):
+        if not self.ai_model.currentText().strip() or self.ai_model.currentText().strip() in presets or self.ai_model.currentText().strip() in ("claude-opus-5-5",):
             if key != "anthropic" or model:
-                self.ai_model.setText(model)
+                if self.ai_model.count() == 0 and model:
+                    self.ai_model.addItem(model)
+                if model:
+                    self.ai_model.setCurrentText(model)
+        try:
+            self._refresh_ai_models()
+        except Exception:
+            pass
+
+    def _refresh_ai_models(self):
+        from ai import PROVIDERS, fetch_models
+        provider = self.ai_provider.currentData()
+        base = self.ai_base_url.text().strip()
+        key = self.ai_api_key.text().strip()
+        current = self.ai_model.currentText().strip()
+        models = fetch_models(provider, base, key)
+        self.ai_model.blockSignals(True)
+        if models:
+            self.ai_model.clear()
+            for m in models:
+                self.ai_model.addItem(m)
+        else:
+            if self.ai_model.count() == 0 and current:
+                self.ai_model.addItem(current)
+        if current:
+            self.ai_model.setCurrentText(current)
+        self.ai_model.blockSignals(False)
+        if models:
+            self.ai_status.setText(f"Найдено моделей: {len(models)}")
+        else:
+            self.ai_status.setText("Список недоступен. Введите имя модели вручную.")
+
+    def _test_ai(self):
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from ai import CloudAI
+        cfg = dict(self.capri.cfg)
+        cfg["enable_ai"] = True
+        cfg["ai_provider"] = self.ai_provider.currentData() or "anthropic"
+        cfg["ai_api_key"] = self.ai_api_key.text().strip()
+        cfg["ai_base_url"] = self.ai_base_url.text().strip()
+        cfg["model"] = self.ai_model.currentText().strip()
+        ai = CloudAI(cfg)
+        if not ai.available:
+            QMessageBox.warning(self, "Капри", "ИИ недоступен: заполните ключ/адрес (для локального Ollama проверьте, что он запущен).")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            answer = ai.ask("Ответь одним словом: ok")
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Тест ИИ", f"Ответ: {answer}")
 
     def _lists_tab(self):
         w = QWidget()
@@ -382,7 +448,7 @@ class SettingsDialog(QDialog):
         updates["ai_provider"] = self.ai_provider.currentData() or "anthropic"
         updates["ai_api_key"] = self.ai_api_key.text().strip()
         updates["ai_base_url"] = self.ai_base_url.text().strip()
-        updates["model"] = self.ai_model.text().strip()
+        updates["model"] = self.ai_model.currentText().strip()
         updates["local_ai"] = bool(self.local_ai.isChecked())
         updates["local_model"] = self.local_model.text().strip()
 
@@ -408,7 +474,7 @@ class SettingsDialog(QDialog):
                 old_models = {v[2] for v in PROVIDERS.values()}
                 if (not updates.get("model")) or updates["model"] in old_models:
                     updates["model"] = PROVIDERS[new_provider][2]
-                    self.ai_model.setText(updates["model"])
+                    self.ai_model.setCurrentText(updates["model"])
         except Exception:
             pass
 

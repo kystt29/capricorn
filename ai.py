@@ -50,6 +50,44 @@ def provider_label(provider):
     return PROVIDERS.get(provider, PROVIDERS["custom"])[0]
 
 
+def fetch_models(provider, base_url="", api_key=""):
+    """Пытается получить список моделей у провайдера. Возвращает список имён (до 80)."""
+    base = (base_url or PROVIDERS.get(provider, ("", "", ""))[1] or "").strip().rstrip("/")
+    names = []
+    try:
+        if provider == "ollama":
+            root = base
+            if root.endswith("/v1"):
+                root = root[:-3]
+            url = root.rstrip("/") + "/api/tags"
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            for m in data.get("models", []):
+                name = m.get("name") or m.get("model")
+                if name and name not in names:
+                    names.append(name)
+        else:
+            url = base.rstrip("/") + "/models"
+            headers = {"Accept": "application/json"}
+            if api_key:
+                if provider == "anthropic":
+                    headers["x-api-key"] = api_key
+                    headers["anthropic-version"] = "2023-06-01"
+                else:
+                    headers["Authorization"] = "Bearer " + api_key
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+            for m in (data.get("data") or data.get("models") or []):
+                name = m.get("id") or m.get("name") or m.get("model")
+                if name and name not in names:
+                    names.append(name)
+    except Exception:
+        return []
+    return names[:80]
+
+
 class CloudAI:
     def __init__(self, cfg):
         self.provider = cfg.get("ai_provider", "anthropic")
