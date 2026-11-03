@@ -119,6 +119,7 @@ def build_procedural(w, h):
     p.setBrush(QColor(8, 20, 16, 240))
     p.drawPolygon(diamond)
     p.end()
+    _CUSTOM_CACHE[key] = img
     return img, (cx, cy)
 
 
@@ -161,9 +162,17 @@ def tinted(img, color):
     return out
 
 
+_CUSTOM_CACHE = {}
+
+
 def load_custom(path, w, h):
+    key = (path, w, h, DPR)
+    cached = _CUSTOM_CACHE.get(key)
+    if cached is not None:
+        return cached.copy()
     src = QImage(path)
     if src.isNull():
+        _CUSTOM_CACHE[key] = None
         return None
     src = src.scaled(round(w * DPR), round(h * DPR), Qt.AspectRatioMode.KeepAspectRatio,
                      Qt.TransformationMode.SmoothTransformation)
@@ -173,6 +182,7 @@ def load_custom(path, w, h):
     p = QPainter(img)
     p.drawImage(QPointF((w - size.width()) / 2, h - size.height()), src)
     p.end()
+    _CUSTOM_CACHE[key] = img
     return img
 
 
@@ -465,7 +475,8 @@ class Avatar(QWidget):
         self.next_hop = 0.0
         self.on_teleport = None      # звук телепорта (ставит main)
 
-        self.anims = load_anims(os.path.join(assets_dir, "anim"))
+        self._anim_dir = os.path.join(assets_dir, "anim")
+        self.anims = None             # анимации грузим по требованию (не тратим время стартапа)
         self.anim = None             # имя проигрываемой анимации
         self.anim_start = 0.0
         self.anim_loop = False
@@ -635,6 +646,8 @@ class Avatar(QWidget):
             self.state, self.k = "vanishing", 0
 
     def play_anim(self, name, loop=False):
+        if self.anims is None:
+            self.anims = load_anims(self._anim_dir) or {}
         if name in self.anims:
             self.anim, self.anim_start, self.anim_loop = name, time.time(), loop
 
@@ -700,7 +713,12 @@ class Avatar(QWidget):
 
     def _figure(self):
         if self.anim:
-            frames = self.anims[self.anim]
+            if self.anims is None:
+                self.anims = load_anims(self._anim_dir) or {}
+            frames = (self.anims or {}).get(self.anim) or []
+            if not frames:
+                self.anim = None
+                return self.base.copy() if not self.roaming else self.roam_img.copy()
             idx = int((time.time() - self.anim_start) * ANIM_FPS)
             if idx < len(frames) or self.anim_loop:
                 return frames[idx % len(frames)].copy()

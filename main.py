@@ -57,6 +57,7 @@ DEFAULTS = {
     "scenarios": {},
     "cache_cleanup_on_start": False,
     "cache_cleanup_days": 14,
+    "high_quality_anim": True,
     "ai_provider": "anthropic",
     "ai_api_key": "",
     "ai_base_url": "",
@@ -778,6 +779,9 @@ def main():
     cfg = load_config()
 
     avatar = Avatar(os.path.join(BASE, "assets"))
+    avatar.high_quality_anim = bool(cfg.get("high_quality_anim", True))
+    if not avatar.high_quality_anim:
+        avatar._crt_line = lambda *a, **k: None
     avatar.hide_after = float(cfg["hide_after_seconds"])
     apply_user(cfg)
     capri = Capri(cfg)

@@ -153,6 +153,7 @@ class SettingsDialog(QDialog):
         self.barge_in = self._check("Можно перебивать голосом", cfg.get("barge_in", True))
         self.use_google_stt = self._check("Уточнять фразу через Google", cfg.get("use_google_stt", True))
         self.type_press_enter = self._check("Отправлять сообщение Enter после «напиши»", cfg.get("type_press_enter", True))
+        self.high_quality_anim = self._check("Высокое качество анимаций", cfg.get("high_quality_anim", True))
         self.cache_cleanup_on_start = self._check("Очищать кеш/логи при запуске", cfg.get("cache_cleanup_on_start", False))
         self.cache_cleanup_days = self._spin(1, 365, cfg.get("cache_cleanup_days", 14), " дн")
 
@@ -161,7 +162,8 @@ class SettingsDialog(QDialog):
         form.addRow("Время ожидания следующей команды:", self.followup_seconds)
         form.addRow("Исчезать через:", self.hide_after)
         for c in (self.greet_on_start, self.search_when_unsure, self.chatter, self.teleport_on_answer,
-                  self.barge_in, self.use_google_stt, self.type_press_enter, self.cache_cleanup_on_start):
+                  self.barge_in, self.use_google_stt, self.type_press_enter, self.cache_cleanup_on_start,
+                  self.high_quality_anim):
             form.addRow(c)
         form.addRow("Очищать кеш старше:", self.cache_cleanup_days)
         form.addRow("Свои появления — от/до минут:", self._pair(self.chatter_min, self.chatter_max))
@@ -562,6 +564,7 @@ class SettingsDialog(QDialog):
         updates["type_press_enter"] = bool(self.type_press_enter.isChecked())
         updates["cache_cleanup_on_start"] = bool(self.cache_cleanup_on_start.isChecked())
         updates["cache_cleanup_days"] = int(self.cache_cleanup_days.value())
+        updates["high_quality_anim"] = bool(self.high_quality_anim.isChecked())
 
         voice_keys = ["voice", "tts_engine", "voice_rate", "voice_pitch", "voice_shift", "voice_lively", "voice_fx",
                       "voice_volume", "browser"]
