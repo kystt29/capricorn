@@ -673,3 +673,20 @@ def play_sound_async(path):
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception:
         pass
+
+
+def edge_voices(locale_prefix=""):
+    """Список голосов Microsoft Edge TTS (ShortName). Если сеть/модуль недоступны — пустой список."""
+    try:
+        import asyncio
+        import edge_tts
+        result = asyncio.run(asyncio.wait_for(edge_tts.list_voices(), timeout=12))
+    except Exception:
+        return []
+    out = []
+    low = (locale_prefix or "").lower()
+    for v in result or []:
+        name = v.get("ShortName")
+        if name and (not low or name.lower().startswith(low)):
+            out.append(name)
+    return sorted(set(out))

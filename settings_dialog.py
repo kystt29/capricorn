@@ -127,7 +127,19 @@ class SettingsDialog(QDialog):
         w = QWidget()
         form = QFormLayout(w)
         cfg = self.cfg
-        self.voice = QLineEdit(cfg.get("voice", "ru-RU-SvetlanaNeural"))
+        self.voice = QComboBox()
+        self.voice.setEditable(True)
+        from voice import edge_voices
+        voices = edge_voices("ru")
+        if not voices:
+            voices = [cfg.get("voice", "ru-RU-SvetlanaNeural")]
+        if cfg.get("voice") and cfg.get("voice") not in voices:
+            voices = [cfg.get("voice")] + voices
+        for v in voices:
+            self.voice.addItem(v)
+        self.voice.setCurrentText(cfg.get("voice", voices[0]))
+        refresh_voices = QPushButton("Обновить голоса")
+        refresh_voices.clicked.connect(self._refresh_edge_voices)
         self.tts_engine = QComboBox()
         self.tts_engine.addItems(["edge", "silero"])
         idx = self.tts_engine.findText(cfg.get("tts_engine", "edge"))
@@ -140,7 +152,10 @@ class SettingsDialog(QDialog):
         self.voice_volume = self._spin(0, 100, cfg.get("voice_volume", 100), "%")
         self.browser = QLineEdit(cfg.get("browser", ""))
 
-        form.addRow("Голос Microsoft (edge):", self.voice)
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(self.voice, 1)
+        voice_row.addWidget(refresh_voices)
+        form.addRow("Голос Microsoft (edge):", voice_row)
         form.addRow("Движок TTS:", self.tts_engine)
         form.addRow("Скорость речи:", self.voice_rate)
         form.addRow("Высота (pitch):", self.voice_pitch)
@@ -391,6 +406,23 @@ class SettingsDialog(QDialog):
         if r >= 0:
             self.scenarios_table.removeRow(r)
 
+    def _refresh_edge_voices(self):
+        from voice import edge_voices
+        current = self.voice.currentText().strip()
+        voices = edge_voices("ru")
+        if not voices:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Капри", "Не удалось получить список голосов Edge TTS (нужен интернет/модуль). Введите имя голоса вручную.")
+            return
+        if current and current not in voices:
+            voices = [current] + voices
+        self.voice.blockSignals(True)
+        self.voice.clear()
+        for v in voices:
+            self.voice.addItem(v)
+        self.voice.setCurrentText(current or voices[0])
+        self.voice.blockSignals(False)
+
     def _lists_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -476,7 +508,7 @@ class SettingsDialog(QDialog):
 
         voice_keys = ["voice", "tts_engine", "voice_rate", "voice_pitch", "voice_shift", "voice_lively", "voice_fx",
                       "voice_volume", "browser"]
-        updates["voice"] = self.voice.text().strip()
+        updates["voice"] = self.voice.currentText().strip()
         updates["tts_engine"] = self.tts_engine.currentText()
         updates["voice_rate"] = self.voice_rate.text().strip()
         updates["voice_pitch"] = self.voice_pitch.text().strip()
