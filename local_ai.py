@@ -10,7 +10,8 @@ import subprocess
 import time
 import urllib.request
 
-from persona import CHARACTER, SPEECH_RULES, user_context
+from freestyle import NoVision
+from persona import CHARACTER, SPEECH_RULES, extra_topics, user_context
 
 log = logging.getLogger("capri")
 URL = "http://127.0.0.1:11434"
@@ -150,6 +151,25 @@ def pick_model(names):
     return (plain or chat or [None])[0]
 
 
+# модели Ollama, которые умеют смотреть на картинки, по предпочтению
+VISION_PREFS = ["qwen2.5vl", "qwen3-vl", "llama3.2-vision", "minicpm-v", "llava", "gemma3", "moondream"]
+VISION_PROMPTS = {
+    "wallpaper": "Это обои рабочего стола. Опиши одним коротким предложением по-русски, что на них изображено: сюжет, "
+                 "персонажи, стиль, цвета. Без вступлений.",
+    "screen": "Это снимок экрана компьютера. Опиши одним коротким предложением по-русски, что на нём происходит: "
+              "какая программа или игра, что видно. Без вступлений; не пересказывай личные данные, пароли и номера.",
+}
+
+
+def pick_vision(names):
+    """Скачанная модель с «глазами» или None (gemma3 1b и 270m картинки не понимают)."""
+    for p in VISION_PREFS:
+        for n in names:
+            if (n == p or n.startswith(p + ":") or n.startswith(p + "-")) and not re.search(r":(1b|270m)\b", n):
+                return n
+    return None
+
+
 class LocalAI:
     def __init__(self, cfg):
         self.model = cfg.get("local_model", "qwen3:8b")
@@ -259,10 +279,43 @@ class LocalAI:
                 {"role": "system", "content": SYSTEM + "\n" + user_context()},
                 {"role": "user", "content":
                  "Ты сама решила ненадолго появиться на экране. Скажи одну короткую спонтанную фразу, "
-                 f"до пятнадцати слов. Тема: {random.choice(CHATTER_TOPICS)}. "
+                 f"до пятнадцати слов. Тема: {random.choice(CHATTER_TOPICS + extra_topics())}. "
                  "Не спрашивай, чем помочь, и не упоминай команды."},
             ], max_tokens=60)
         except Exception:
+            return None
+        text = drop_third_person(re.sub(r"\s+", " ", FOREIGN.sub("", text)).strip().strip('"«»'))
+        text = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", text).strip()
+        return text if 5 < len(text) < 160 and re.search(r"[.!?…]$", text) else None
+
+    def describe_image(self, b64, kind):
+        """Одно предложение о картинке (обои или экран) от модели с «глазами»; NoVision — если такой модели нет.
+        Картинка уходит только в Ollama на этом компьютере."""
+        model = pick_vision(self.installed() or [])
+        if not model:
+            raise NoVision()
+        resp = _post("/api/chat", {
+            "model": model,
+            "messages": [{"role": "user", "content": VISION_PROMPTS.get(kind, VISION_PROMPTS["screen"]),
+                          "images": [b64]}],
+            "stream": False,
+            "think": False,
+            "keep_alive": "2m",
+            "options": {"num_predict": 90, "temperature": 0.3},
+        }, 180)
+        text = strip_reasoning(resp.get("message", {}).get("content", ""))
+        text = re.sub(r"\s+", " ", FOREIGN.sub("", text)).strip()
+        return text[:220] or None
+
+    def quip(self, task):
+        """Короткая подколка по ситуации (task — что произошло и как постебать). None — если не вышло."""
+        try:
+            text = self._chat([
+                {"role": "system", "content": SYSTEM + "\n" + user_context()},
+                {"role": "user", "content": "Ты наблюдаешь за пользователем и подкалываешь его. Ситуация: " + task},
+            ], max_tokens=60)
+        except Exception as e:
+            log.info("Подколка: локальная модель недоступна: %s", e)
             return None
         text = drop_third_person(re.sub(r"\s+", " ", FOREIGN.sub("", text)).strip().strip('"«»'))
         text = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", text).strip()
