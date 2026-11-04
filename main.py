@@ -40,8 +40,16 @@ try:
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
+    import commentary
+    from commentary import TOGGLE_RE, Commentator, heard_laugh, heard_outcome
+    import effects
+    import freestyle
+    from games import GameTracker
+    from learning import Learning
     from local_ai import LocalAI
-    from persona import LINES, gendered, line, set_user
+    import screen as screenmod
+    from screen import ScreenWatcher
+    from persona import CONTEXT_PROVIDERS, LINES, TOPIC_PROVIDERS, gendered, line, set_user
     from avatar import Avatar
     import zapret
     from voice import (Listener, Speaker, default_input_name, google_stt, input_devices, make_glitch_sound,
@@ -55,6 +63,16 @@ except ImportError as e:
 DEFAULTS = {
     "enable_ai": False,
     "scenarios": {},
+    "track_games": True,
+    "animations": True,
+    "commentary": True,
+    "commentary_minutes": 6,
+    "commentary_anytime": False,
+    "commentary_wallpaper": False,
+    "profanity": False,
+    "commentary_titles": True,
+    "react_to_voice": False,
+    "screen_reactions": False,
     "steam_confirm": True,
     "steam_path": "",
     "steam_friends": {},
@@ -264,6 +282,7 @@ class Capri(QObject):
     roam = Signal()
     hop = Signal()
     move_to = Signal(str)
+    fx = Signal(str)
 
     def __init__(self, cfg):
         super().__init__()
@@ -279,6 +298,19 @@ class Capri(QObject):
         self.config_mtime = self._config_mtime()
         self.zapret_checked = False  # предлагали ли уже исправить zapret в этом сеансе
         self.actions.local = self.local
+        if self.cfg.get("track_games", True):
+            self.game_tracker = GameTracker(self.actions.games, self._on_game_event)
+        else:
+            self.game_tracker = None
+        self.learning = Learning(os.path.join(BASE, "learning.json"))
+        CONTEXT_PROVIDERS.append(self.learning.habits_summary)
+        TOPIC_PROVIDERS.append(self.learning.habit_topics)
+        CONTEXT_PROVIDERS.append(lambda: PROFANITY_CONTEXT if self.cfg.get("profanity") else "")
+        self.commentator = Commentator(self.actions.games, self._on_comment, self._can_comment, self.cfg,
+                                       learn=self.learning, looker=self._look)
+        self.actions.commentator = self.commentator
+        self.screen = ScreenWatcher(self.actions.games, self._on_screen_outcome, self.cfg)
+        self.profanity_toggle_reply = None
         self.speaker = Speaker(cfg)
         self.jobs = queue.Queue()
         self.awake_until = 0.0
@@ -309,6 +341,10 @@ class Capri(QObject):
             self.listener.start()
             if self.cfg.get("cache_cleanup_on_start"):
                 threading.Thread(target=lambda: self.cleanup_cache_and_logs(speak=False), daemon=True).start()
+            if self.game_tracker:
+                self.game_tracker.start()
+            self.commentator.start()
+            self.screen.start()
         else:
             self.jobs.put(("say", line("no_model")))
             return
@@ -429,6 +465,7 @@ class Capri(QObject):
             return
         woke = self.has_wake(text)
         if not woke and now > self.awake_until:
+            self.overheard(text)
             return
         cmd = self.strip_wake(text) if woke else text
         if STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3:
@@ -533,6 +570,8 @@ class Capri(QObject):
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
                     "scenarios", "user_name_mode", "user_name", "user_gender",
+                    "track_games", "animations", "commentary", "commentary_minutes", "commentary_anytime",
+                    "commentary_wallpaper", "profanity", "commentary_titles", "react_to_voice", "screen_reactions",
                     "steam_confirm", "steam_path", "steam_friends"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
@@ -610,6 +649,68 @@ class Capri(QObject):
         self.summon.emit()
         self.jobs.put(("text", text))
 
+    def _look(self, kind):
+        """Описание обоев или экрана для наблюдателя (его поток); None, если посмотреть нечем."""
+        if not self.local:
+            return None
+        try:
+            return freestyle.describe(self.local, kind)
+        except freestyle.NoVision:
+            if not getattr(self, "_novision_logged", False):
+                self._novision_logged = True
+                log.info("Обои и экран: в Ollama нет модели с «глазами» (например: ollama pull qwen2.5vl:3b)")
+        except Exception:
+            log.exception("Не удалось посмотреть (%s)", kind)
+        return None
+
+    def _on_screen_outcome(self, kind):
+        """Надпись победы или поражения на экране в игре (поток наблюдателя за экраном)."""
+        key = self.actions.games.current()
+        g = self.actions.games.get(key) if key else None
+        found = self.commentator.outcome(kind, {"t": g["name"] if g else ""})
+        if found:
+            self.jobs.put(("roast",) + found)
+
+    def _on_game_event(self, kind, key, minutes):
+        """Трекер игр (его поток): Капри говорит только когда игра закрылась, поверх игры не лезет.
+        Подколка («слил», марафон) важнее обычного «наиграл N минут»; первое знакомство с игрой — не стебём."""
+        first = key in self.actions.game_announce
+        text = self.actions.on_game_event(kind, key, minutes)
+        found = self.commentator.on_game_event(kind, key, minutes)
+        if found and not first:
+            self.jobs.put(("roast",) + found)
+        elif text:
+            self.jobs.put(("say", text))
+
+    def _can_comment(self, strict):
+        """Можно ли сейчас вставить реплику: Капри молчит и не занята, а для обычных подколок ещё и ничего
+        на весь экран (игра, фильм) и нет разговора с ней."""
+        if self.speaking or not self.jobs.empty():
+            return False
+        return not strict or (time.time() - self.last_activity > 20 and not fullscreen_app_active())
+
+    def _play_fx(self, name):
+        if name and self.cfg.get("animations", True):
+            self.fx.emit(name)
+
+    def _on_comment(self, situation, detail):
+        """Наблюдатель (его поток): подколку придумает рабочий поток, чтобы не стоять в ожидании нейросети."""
+        self.jobs.put(("roast", situation, detail))
+
+    def overheard(self, text):
+        """Услышала разговор без имени. Только если включено "react_to_voice": «слили!» и «ура!» в игре — стёб или
+        похвала; смех сразу после её реплики — оценка «зашло»."""
+        if not self.cfg.get("react_to_voice") or self.speaking:
+            return
+        kind = heard_outcome(text)
+        if kind:
+            found = self.commentator.overheard(kind)
+            if found:
+                self.jobs.put(("roast",) + found)
+        elif heard_laugh(text):
+            self.learning.feedback(True)
+
+
     # ----- рабочий поток -----
     def _worker(self):
         try:
@@ -627,6 +728,13 @@ class Capri(QObject):
 
     def _process(self, job):
         kind = job[0]
+        if kind == "roast":
+            text = self.commentator.render(job[1], job[2], self.local.quip if self.local else None, line)
+            self.summon.emit()
+            self._play_fx(effects.for_situation(job[1], (job[2] or {}).get("mode")))
+            if text and not self.say(text):
+                self.mode.emit("idle", 0.0)
+            return
         if kind == "chatter":
             text = self.chatter_line()
             if random.random() < self.cfg.get("roam_chance", 0.5):
@@ -796,6 +904,7 @@ def main():
     capri.subtitle.connect(avatar.set_subtitle)
     capri.quit_app.connect(app.quit)
     capri.anim.connect(avatar.play_anim)
+    capri.fx.connect(avatar.play_effect)
     capri.roam.connect(avatar.start_roam)
     capri.hop.connect(avatar.start_hopping)
     capri.move_to.connect(avatar.move_to_named)

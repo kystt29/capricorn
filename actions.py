@@ -20,7 +20,11 @@ import psutil
 import automation
 import media
 import steam
-from persona import line
+import games
+import commentary
+import freestyle
+import learning
+from persona import line, CONTEXT_PROVIDERS, TOPIC_PROVIDERS
 
 log = logging.getLogger("capri")
 NO_WINDOW = 0x08000000
@@ -950,7 +954,29 @@ class Actions:
         self.youtube_opened_at = 0.0  # когда Капри последний раз открывала YouTube
         self.media_paused = None      # какой плеер Капри поставила на паузу
         self.local = None
+        self.games = games.GameBook(os.path.join(base_dir, "games.json"), norm, translit)
+        self.game_announce = set()
+        self.game_spoke_at = 0.0
+        CONTEXT_PROVIDERS.append(self.games.summary)
+        TOPIC_PROVIDERS.append(self.games.chatter_topics)
         self.routes = [
+            (freestyle.ANYTIME_RE, self.anytime_toggle),
+            (freestyle.PROFANITY_RE, self.profanity_toggle),
+            (freestyle.WALLPAPER_RE, lambda c, m: self.look_cmd("wallpaper")),
+            (freestyle.SCREEN_RE, lambda c, m: self.look_cmd("screen")),
+            (commentary.TOGGLE_RE, self.commentary_toggle),
+            (learning.LIKE_RE, self.feedback_like),
+            (learning.DISLIKE_RE, self.feedback_dislike),
+            (commentary.WIN_RE, self.win_cmd),
+            (commentary.LOSS_RE, self.loss_cmd),
+            (steam.SEND_RE, self.steam_message),  # до обычной печати «напиши …»
+            # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
+            (games.TEACH_RE, self.game_teach),
+            (games.FORGET_RE, self.game_forget),
+            (games.NOTE_RE, self.game_note),
+            (games.INFO_RE, self.game_info),
+            (games.TIME_RE, self.game_time),
+            (games.LAUNCH_RE, self.game_launch),
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
             (r"^(спрячься|скройся|исчезни|пока|отбой|свободна)\b|"
              r"^(уйди|уходи|убирайся|свали|сгинь|испарись|скрой себя|убери себя)\b|"
@@ -1006,7 +1032,6 @@ class Actions:
             (r"^(нажми на поиск|нажми поиск|перейди в поиск|в поиск|поиск|поставь курсор в поиск)$",
              self.search_field),
             (r"^(нажми|нажать|зажми|жми|набери сочетание) (?P<k>.+)$", self.press),
-            (steam.SEND_RE, self.steam_message),  # «напиши Васе в стиме ...» — раньше обычной печати
             (rf"^({automation.TYPE_VERBS})\s+\S", self.type_cmd),
             (r"^(открой |зайди в |перейди в |выбери |найди )?(в )?(телеграм\w*|telegram|телег\w*|тг )?\s*"
              r"((?P<ord>{}) )?(чат\w*|chat|диалог\w*|переписк\w*|контакт\w*|беседу|беседа|группу|канал)"
@@ -2138,6 +2163,198 @@ class Actions:
             self.pending = do  # дальше handle() ждёт «да»
             return Reply(line("steam_ask", who=label, t=text))
         return do()
+
+    # --- подколки (наблюдатель — в commentary.py) ---
+    def commentary_toggle(self, c, m):
+        """«не комментируй» / «комментируй меня»: включает и выключает подколки (само переключение делает main)."""
+        off = commentary.toggle_wants_off(c)
+        return Reply(line("commentary_off" if off else "commentary_on"), "commentary:" + ("off" if off else "on"))
+
+    def anytime_toggle(self, c, m):
+        """«комментируй всё» / «выключи свободный режим» (само переключение делает main)."""
+        off = bool(re.search(freestyle.ANYTIME_OFF, c))
+        return Reply(line("anytime_off" if off else "anytime_on"), "anytime:" + ("off" if off else "on"))
+
+    def profanity_toggle(self, c, m):
+        """«ругайся» / «не матерись» (само переключение делает main)."""
+        off = bool(re.search(freestyle.PROFANITY_OFF, c))
+        return Reply(line("profanity_off" if off else "profanity_on"), "profanity:" + ("off" if off else "on"))
+
+    def look_cmd(self, kind):
+        """«прокомментируй обои» / «прокомментируй экран»: посмотреть (локальная модель с «глазами») и сказать своё.
+        По просьбе — всегда, независимо от настроек комментариев."""
+        if not self.local:
+            return Reply(line("look_no_model"))
+        try:
+            what = freestyle.describe(self.local, kind)
+        except freestyle.NoVision:
+            return Reply(line("look_no_model"))
+        except Exception:
+            log.exception("Не смогла посмотреть (%s)", kind)
+            return Reply(line("look_fail"))
+        if not what:
+            return Reply(line("look_fail"))
+        detail = {"what": what}
+        if self.commentator:
+            return Reply(self.commentator.render(kind, detail, self.local.quip, line))
+        return Reply(commentary.compose(kind, detail, self.local.quip, line, rude=bool(self.cfg.get("profanity"))))
+
+    def _outcome_cmd(self, kind):
+        """«я слил» / «ура, прошёл»: стёб, подбадривание или похвала — по тому, что заходит. Если подколки выключены,
+        фраза идёт дальше, как обычный разговор."""
+        if not self.cfg.get("commentary", True):
+            return None
+        key = self.games.current()
+        g = self.games.get(key) if key else None
+        detail = {"t": g["name"] if g else ""}
+        quip = self.local.quip if self.local else None
+        if self.commentator:
+            found = self.commentator.outcome(kind, detail, explicit=True)  # сама позвала — отвечаем всегда
+            if found:
+                return Reply(self.commentator.render(found[0], found[1], quip, line))
+            return None
+        return Reply(commentary.compose(kind, detail, quip, line, rude=bool(self.cfg.get("profanity"))))
+
+    def loss_cmd(self, c, m):
+        return self._outcome_cmd("loss")
+
+    def win_cmd(self, c, m):
+        return self._outcome_cmd("win")
+
+    def _feedback(self, positive):
+        """Твоя реакция на только что сказанную реплику Капри. Без реплики это обычный разговор, и фраза идёт дальше."""
+        learn = self.commentator.learn if self.commentator else None
+        if not learn or not learn.feedback(positive):
+            return None
+        return Reply(line("feedback_like" if positive else "feedback_dislike"))
+
+    def feedback_like(self, c, m):
+        return self._feedback(True)
+
+    def feedback_dislike(self, c, m):
+        return self._feedback(False)
+
+    # --- игры пользователя (учёт и память — в games.py) ---
+    def _learn_about(self, key):
+        """Фоном узнаёт об игре из Википедии, чтобы потом рассказать о ней. Чужую статью не берём."""
+        g = self.games.get(key)
+        if not g or g.get("about"):
+            return
+        text = wiki_summary(g["name"] + " игра", 2)
+        if text and games.about_matches(g["name"], text):
+            self.games.set_about(key, text)
+
+    def on_game_event(self, kind, key, minutes):
+        """Событие трекера → что сказать вслух (или None). Говорим только когда игру закрыли."""
+        g = self.games.get(key)
+        if not g:
+            return None
+        if kind == "new":
+            self.game_announce.add(key)
+            threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+            return None
+        if kind != "end":
+            return None
+        first = key in self.game_announce
+        self.game_announce.discard(key)
+        now = time.time()
+        if first:
+            text = line("game_new", t=g["name"], d=games.fmt_minutes(max(minutes, 1)))
+        elif minutes >= 30 and now - self.game_spoke_at > 3 * 3600:
+            text = line("game_end", t=g["name"], d=games.fmt_minutes(minutes))
+        else:
+            return None
+        self.game_spoke_at = now
+        return text
+
+    def game_teach(self, c, m):
+        """«запомни эту игру как терария» — игра, окно которой сейчас на экране."""
+        name = re.sub(r"^(как|под названием|под именем|с названием|назови)\s+", "", (m.group("name") or "").strip())
+        name = name.strip(" «»\"")
+        if not name:
+            return Reply(line("game_noname"))
+        exe = automation.window_exe(ctypes.windll.user32.GetForegroundWindow())
+        base = os.path.splitext(os.path.basename(exe or ""))[0].lower()
+        if not exe or base in PROTECTED_PROCS or base in games.GENERIC_HOSTS:
+            return Reply(line("game_no_window"))
+        key, _ = self.games.teach(name, exe)
+        threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+        return Reply(line("game_taught", t=name))
+
+    def game_forget(self, c, m):
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        if key is None:
+            return None  # не игра из списка — пусть решает обычное «забудь программу»
+        return Reply(line("game_forgot", t=self.games.forget(name)))
+
+    def game_note(self, c, m):
+        """«запиши про игру: на третьем боссе нужен лук» — заметка к игре, которая запущена или была последней."""
+        key = self.games.current()
+        if key is None:
+            return Reply(line("game_note_none"))
+        note = m.group("note").strip()
+        self.games.add_note(key, note)
+        return Reply(line("game_note", t=self.games.get(key)["name"], n=note[:80]))
+
+    def game_list(self, c, m):
+        top = self.games.top(3)
+        if not top:
+            return Reply(line("game_none"))
+        parts = [line("game_top", t=top[0][1]["name"], d=games.fmt_minutes(top[0][1]["minutes"]))]
+        if len(top) > 1:
+            parts.append(line("game_others", t=", ".join(f"«{g['name']}»" for _, g in top[1:])))
+        if self.games.running():
+            parts.append(line("game_running", t=", ".join(f"«{n}»" for n in self.games.running())))
+        return Reply(" ".join(parts))
+
+    def game_time(self, c, m):
+        key = self.games.find(m.group("name"))
+        if key is None:
+            return None  # «сколько я играл сегодня» — не про игру из списка
+        g = self.games.get(key)
+        text = line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"])
+        if g["last_played"] and key not in self.games.active:
+            text += " " + line("game_last", w=games.ago(g["last_played"]))
+        return Reply(text)
+
+    def game_info(self, c, m):
+        """«расскажи про игру террария» — что Капри о ней узнала и что ты сам записал."""
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        g = self.games.get(key) if key else None
+        about = g.get("about") if g else None
+        if not about:
+            about = wiki_summary(name + " игра", 2)
+            if not (about and games.about_matches(name, about)):
+                about = None
+            elif key:
+                self.games.set_about(key, about)
+        if not about and not g:
+            return None  # ничего не знаю — пусть ответит нейросеть
+        parts = [about] if about else []
+        if g:
+            parts.append(line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"]))
+            if g["notes"]:
+                parts.append("Твоя заметка: " + g["notes"][-1]["text"] + ".")
+        return Reply(line("game_info", t=" ".join(parts)))
+
+    def game_launch(self, c, m):
+        """«запусти террарию» — только для игр из списка и только если это не свой сайт или программа."""
+        name = m.group("name").strip()
+        n = norm(name)
+        if n in self.sites or n in self.apps or n in self.aliases:
+            return None
+        key = self.games.find(name, min_score=0.8)
+        if key is None:
+            return None
+        g = self.games.get(key)
+        if key in self.games.active:
+            return Reply(line("game_already", t=g["name"]))
+        if not os.path.isfile(g["exe"]):
+            return Reply(line("game_launch_fail", t=g["name"]))
+        subprocess.Popen([g["exe"]], cwd=os.path.dirname(g["exe"]))
+        return Reply(line("game_launch", t=g["name"]))
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):

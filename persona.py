@@ -252,6 +252,9 @@ LINES = {
 # кто пользователь: пол ("male" / "female") и имя ("" — не называть). Ставит main из настроек.
 USER = {"gender": "male", "name": ""}
 
+CONTEXT_PROVIDERS = []
+TOPIC_PROVIDERS = []
+
 
 def set_user(name, gender):
     USER["name"] = (name or "").strip()
@@ -280,4 +283,22 @@ def user_context():
     if USER["name"]:
         text += (f" Пользователя зовут {USER['name']}. Иногда, не в каждом ответе, обращайся по имени — "
                  f"вместо «чумба».")
+    for provider in CONTEXT_PROVIDERS:
+        try:
+            extra = provider()
+        except Exception:
+            continue
+        if extra:
+            text += "\n" + extra
     return text
+
+
+def extra_topics():
+    """Темы для спонтанных реплик от подключённых модулей."""
+    topics = []
+    for provider in TOPIC_PROVIDERS:
+        try:
+            topics += provider()
+        except Exception:
+            continue
+    return topics
