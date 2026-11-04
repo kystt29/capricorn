@@ -19,6 +19,7 @@ import psutil
 
 import automation
 import media
+import steam
 from persona import line
 
 log = logging.getLogger("capri")
@@ -1005,6 +1006,7 @@ class Actions:
             (r"^(нажми на поиск|нажми поиск|перейди в поиск|в поиск|поиск|поставь курсор в поиск)$",
              self.search_field),
             (r"^(нажми|нажать|зажми|жми|набери сочетание) (?P<k>.+)$", self.press),
+            (steam.SEND_RE, self.steam_message),  # «напиши Васе в стиме ...» — раньше обычной печати
             (rf"^({automation.TYPE_VERBS})\s+\S", self.type_cmd),
             (r"^(открой |зайди в |перейди в |выбери |найди )?(в )?(телеграм\w*|telegram|телег\w*|тг )?\s*"
              r"((?P<ord>{}) )?(чат\w*|chat|диалог\w*|переписк\w*|контакт\w*|беседу|беседа|группу|канал)"
@@ -2106,6 +2108,36 @@ class Actions:
         except Exception:
             pass
         return Reply(line("game_mode_on"))
+
+    def steam_message(self, c, m):
+        """«напиши Васе в стиме, что я опоздаю» — находит друга, читает текст вслух и после «да» отправляет."""
+        friends = steam.load_friends(self.cfg.get("steam_path", ""))
+        aliases = self.cfg.get("steam_friends") or {}
+
+        def find(query):
+            return steam.find_friend(query, friends, aliases, norm, translit)
+        if not friends and not aliases:
+            return Reply(line("steam_no_friends"))
+        parsed = steam.parse(c, find)
+        if parsed is None:
+            return None
+        kind, who, text = parsed
+        if kind == "no_friend":
+            return Reply(line("steam_no_friend", t=who or "без имени"))
+        _, steam64, label = who
+        if kind == "no_text":
+            return Reply(line("steam_no_text", who=label))
+        if not steam.is_running():
+            return Reply(line("steam_not_running"))
+
+        def do():
+            if not steam.send_message(steam64, label, text):
+                return Reply(line("steam_chat_fail", who=label))
+            return Reply(line("steam_sent", who=label, t=text))
+        if self.cfg.get("steam_confirm", True):
+            self.pending = do  # дальше handle() ждёт «да»
+            return Reply(line("steam_ask", who=label, t=text))
+        return do()
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):

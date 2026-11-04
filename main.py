@@ -55,6 +55,9 @@ except ImportError as e:
 DEFAULTS = {
     "enable_ai": False,
     "scenarios": {},
+    "steam_confirm": True,
+    "steam_path": "",
+    "steam_friends": {},
     "cache_cleanup_on_start": False,
     "cache_cleanup_days": 14,
     "high_quality_anim": True,
@@ -529,7 +532,8 @@ class Capri(QObject):
             return
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
-                    "scenarios", "user_name_mode", "user_name", "user_gender"):
+                    "scenarios", "user_name_mode", "user_name", "user_gender",
+                    "steam_confirm", "steam_path", "steam_friends"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)
