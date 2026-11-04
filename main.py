@@ -786,6 +786,7 @@ def main():
     avatar.high_quality_anim = bool(cfg.get("high_quality_anim", True))
     if not avatar.high_quality_anim:
         avatar._crt_line = lambda *a, **k: None
+        avatar.fx.play = lambda *a, **k: None
     avatar.hide_after = float(cfg["hide_after_seconds"])
     apply_user(cfg)
     capri = Capri(cfg)
