@@ -17,6 +17,7 @@
 import difflib
 import logging
 import os
+import sys
 import re
 import time
 
@@ -215,6 +216,11 @@ def find_friend(query, friends, aliases, norm, translit):
     for account, names in friends.items():
         for n in names:
             by_name.setdefault(n.lower(), (account, names[0]))
+    by_clean = {}
+    for key, value in by_name.items():
+        clean = re.sub(r"[^\w]", "", key)
+        if clean:
+            by_clean.setdefault(clean, value)
     for alias, target in (aliases or {}).items():
         s = score(query, alias, norm, translit)
         if s < MATCH_MIN:
@@ -222,9 +228,27 @@ def find_friend(query, friends, aliases, norm, translit):
         target = str(target).strip()
         if target.isdigit():
             consider(s + 0.01, steamid64(target), alias)  # свой список чуть важнее общего
-        elif target.lower() in by_name:
-            account, label = by_name[target.lower()]
-            consider(s + 0.01, steamid64(account), label)
+        else:
+            account_label = by_name.get(target.lower())
+            if account_label is None:
+                needle = re.sub(r"[^\w]", "", target.lower())
+                if needle:
+                    for key, value in by_clean.items():
+                        if needle in key or key in needle:
+                            account_label = value
+                            break
+            if account_label is None:
+                # target could be a decorated nik (e.g. "xX_Vasya_Xx" vs local "VAS")
+                # or remembered with other symbols; try flexible similarity.
+                best_friend = None
+                for name, value in by_name.items():
+                    if score(target, name, norm, translit) >= 0.45 or translit(target.lower()) in translit(name):
+                        best_friend = value
+                        break
+                account_label = best_friend
+            if account_label is not None:
+                account, label = account_label
+                consider(s + 0.01, steamid64(account), label)
     for account, names in friends.items():
         for n in names:
             consider(score(query, n, norm, translit), steamid64(account), names[0])

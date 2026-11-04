@@ -59,6 +59,7 @@ class SettingsDialog(QDialog):
             ("🤖 ИИ", self._ai_tab(), "Провайдеры, модели, ключи и локальный ИИ."),
             ("📋 Списки", self._lists_tab(), "Сайты, программы и свои ответы."),
             ("🧩 Сценарии", self._scenarios_tab(), "Наборы действий по одному имени."),
+            ("🎮 Steam", self._steam_tab(), "Настройки отправки сообщений друзьям в Steam."),
             ("📝 config.json", self._raw_tab(), "Ручной JSON-редактор."),
         ]
         for label, widget, tip in tabs:
@@ -482,6 +483,51 @@ class SettingsDialog(QDialog):
         self.voice.setCurrentText(current or voices[0])
         self.voice.blockSignals(False)
 
+    def _steam_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel("Настройки отправки сообщений друзьям в Steam. Ники/aliasы ниже, или редактируй config.json (steam_friends).")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        self.steam_confirm = QCheckBox("Читать сообщение вслух и ждать подтверждения «да»")
+        self.steam_confirm.setChecked(bool(self.cfg.get("steam_confirm", True)))
+        lay.addWidget(self.steam_confirm)
+        form = QFormLayout()
+        self.steam_path = QLineEdit(self.cfg.get("steam_path", ""))
+        form.addRow("Путь к папке Steam (если не нашлось автоматически):", self.steam_path)
+        lay.addLayout(form)
+        self.steam_table = QTableWidget(0, 2)
+        self.steam_table.setHorizontalHeaderLabels(["Твой alias", "Ник/ID друга в Steam"])
+        self.steam_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.steam_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.steam_table, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Добавить")
+        remove = QPushButton("Удалить")
+        add.clicked.connect(self._add_steam_alias)
+        remove.clicked.connect(self._remove_steam_alias)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch()
+        lay.addLayout(row)
+        for name, target in sorted((self.cfg.get("steam_friends") or {}).items()):
+            r = self.steam_table.rowCount()
+            self.steam_table.insertRow(r)
+            self.steam_table.setItem(r, 0, QTableWidgetItem(str(name)))
+            self.steam_table.setItem(r, 1, QTableWidgetItem(str(target)))
+        return w
+
+    def _add_steam_alias(self):
+        r = self.steam_table.rowCount()
+        self.steam_table.insertRow(r)
+        self.steam_table.setItem(r, 0, QTableWidgetItem(""))
+        self.steam_table.setItem(r, 1, QTableWidgetItem(""))
+
+    def _remove_steam_alias(self):
+        r = self.steam_table.currentRow()
+        if r >= 0:
+            self.steam_table.removeRow(r)
+
     def _lists_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -593,6 +639,18 @@ class SettingsDialog(QDialog):
         user_mode = self.user_name_mode.currentData() or "none"
         user_name = self.user_name.text().strip()
         user_gender = self.user_gender.currentData() or "male"
+
+        updates["steam_confirm"] = bool(self.steam_confirm.isChecked())
+        updates["steam_path"] = self.steam_path.text().strip()
+        steam_friends = {}
+        for r in range(self.steam_table.rowCount()):
+            a = self.steam_table.item(r, 0)
+            b = self.steam_table.item(r, 1)
+            name = a.text().strip() if a else ""
+            target = b.text().strip() if b else ""
+            if name and target:
+                steam_friends[name] = target
+        updates["steam_friends"] = steam_friends
 
         scenarios = {}
         for r in range(self.scenarios_table.rowCount()):
