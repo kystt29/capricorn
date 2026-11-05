@@ -554,13 +554,16 @@ class Speaker:
             except Exception:
                 log.exception("Silero не сработал, говорю голосом Microsoft")
         import edge_tts
+        # уникальные временные файлы на каждый синтез — не конфликтуем с playback/другими потоками
+        base = os.path.join(tempfile.gettempdir(), f"capri_tts_{os.getpid()}_{int(time.time() * 1000)}")
+        self.path = base + ".mp3"
         # по предложениям: они синтезируются параллельно, поэтому длинный ответ ждём как одно предложение
         sentences = [s for s in re.split(r"(?<=[.!?…])\s+", text) if s.strip()] or [text]
         semis = lively_semitones(sentences, self.shift, random.Random(), self.lively)
         # тон поднимаем сами (Microsoft выше ~260 Гц не поднимает), а ускорение от этого
         # заранее гасим, замедляя синтез на столько же
         rates = [f"{round(_pct(self.rate) - (2 ** (k / 12) - 1) * 100):+d}%" for k in semis]
-        parts = [f"{self.path[:-4]}_{i}.mp3" for i in range(len(sentences))]
+        parts = [f"{base}_{i}.mp3" for i in range(len(sentences))]
 
         async def go():  # фразы синтезируются параллельно — задержка как у одной
             await asyncio.gather(*(edge_tts.Communicate(s, self.voice, rate=r, pitch=self.pitch).save(f)
@@ -575,8 +578,8 @@ class Speaker:
             x = np.concatenate(chunks)
             if self.fx > 0:
                 x = fx_process(x, self.fx)
-            write_wav(dst, x, volume=self.volume)
-            return dst
+            write_wav(base + ".wav", x, volume=self.volume)
+            return base + ".wav"
         except Exception:
             log.exception("Обработка голоса не удалась, говорю чистым голосом")
             if len(parts) == 1:

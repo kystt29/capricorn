@@ -530,6 +530,33 @@ class Capri(QObject):
             self.jobs.put(("say", f"Очистила кеш: {removed} файлов, журнал обрезан."))
         log.info("Очистка завершена, удалено: %d", removed)
 
+    def set_commentary(self, on):
+        """Включить/выключить комментарии."""
+        self.cfg["commentary"] = bool(on)
+        save_setting("commentary", bool(on))
+        log.info("Комментарии: %s", "включены" if on else "выключены")
+
+    def set_profanity(self, on):
+        """Включить/выключить мат в подколках."""
+        self.cfg["profanity"] = bool(on)
+        save_setting("profanity", bool(on))
+        log.info("Мат: %s", "включён" if on else "выключен")
+
+    def set_anytime(self, on):
+        """Свободный режим."""
+        self.cfg["commentary_anytime"] = bool(on)
+        save_setting("commentary_anytime", bool(on))
+        if on and not self.cfg.get("commentary", True):
+            self.set_commentary(True)
+        log.info("Свободный режим: %s", "включён" if on else "выключен")
+
+    def set_screen_reactions(self, on):
+        """Реакции по экрану."""
+        self.cfg["screen_reactions"] = bool(on)
+        save_setting("screen_reactions", bool(on))
+        self.screen.broken = False
+        log.info("Реакции по экрану: %s", "включены" if on else "выключены")
+
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
         self.cfg["chatter"] = bool(on)
@@ -787,6 +814,12 @@ class Capri(QObject):
         reply = self.actions.handle(cmd)
         if reply is not None and reply.action in ("mic_info", "mic_next"):
             reply = self.mic_command(reply.action)
+        elif reply is not None and reply.action and reply.action.startswith("commentary:"):
+            self.set_commentary(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("profanity:"):
+            self.set_profanity(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("anytime:"):
+            self.set_anytime(reply.action.endswith("on"))
         if reply is None:
             if self.cfg.get("enable_ai") and self.ai.available:
                 reply = Reply(self.ai.ask(cmd), "answer")
@@ -1028,9 +1061,33 @@ def main():
             chatter_act.toggled.connect(capri.set_chatter)
             menu.addAction(chatter_act)
 
-            def sync_search(a=search_act, b=chatter_act):
+            # комментарии и стиль (PR #11)
+            commentary_act = QAction("Комментировать действия", menu)
+            commentary_act.setCheckable(True)
+            commentary_act.toggled.connect(capri.set_commentary)
+            menu.addAction(commentary_act)
+
+            profanity_act = QAction("Ругаться (мат в подколках)", menu)
+            profanity_act.setCheckable(True)
+            profanity_act.toggled.connect(capri.set_profanity)
+            menu.addAction(profanity_act)
+
+            anytime_act = QAction("Комментировать всё (свободный режим)", menu)
+            anytime_act.setCheckable(True)
+            anytime_act.toggled.connect(capri.set_anytime)
+            menu.addAction(anytime_act)
+
+            screen_act = QAction("Реагировать на экран в играх (эксперимент)", menu)
+            screen_act.setCheckable(True)
+            screen_act.toggled.connect(capri.set_screen_reactions)
+            menu.addAction(screen_act)
+
+            def sync_search(a=search_act, b=chatter_act, c=commentary_act, d=profanity_act,
+                            e=anytime_act, f=screen_act):
                 capri.reload_config_if_changed(speak=False)  # могли поменять в config.json руками
-                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True)):
+                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True),
+                                          (c, "commentary", True), (d, "profanity", False),
+                                          (e, "commentary_anytime", False), (f, "screen_reactions", False)):
                     act.blockSignals(True)
                     act.setChecked(bool(capri.cfg.get(key, default)))
                     act.blockSignals(False)
