@@ -63,6 +63,8 @@ except ImportError as e:
 DEFAULTS = {
     "enable_ai": False,
     "scenarios": {},
+    "vision_engine": "modlens", 
+    "vision_source": "gemini",
     "track_games": True,
     "animations": True,
     "commentary": True,

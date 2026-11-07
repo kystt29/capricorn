@@ -60,6 +60,7 @@ class SettingsDialog(QDialog):
             ("📋 Списки", self._lists_tab(), "Сайты, программы и свои ответы."),
             ("🧩 Сценарии", self._scenarios_tab(), "Наборы действий по одному имени."),
             ("🎮 Steam", self._steam_tab(), "Настройки отправки сообщений друзьям в Steam."),
+            ("👁 Видение", self._vision_tab(), "Настройки видения и ModLens."),
             ("📝 config.json", self._raw_tab(), "Ручной JSON-редактор."),
         ]
         for label, widget, tip in tabs:
@@ -528,6 +529,89 @@ class SettingsDialog(QDialog):
         if r >= 0:
             self.steam_table.removeRow(r)
 
+    def _vision_tab(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        hint = QLabel("Видение для текстовых моделей. ModLens может читать картинки через Gemini API, OpenAI-compatible endpoint, Anthropic или Antigravity CLI. Текстовое описание потом передаётся в модель Капри.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        form = QFormLayout()
+        self.vision_engine = QComboBox()
+        self.vision_engine.addItems(["modlens", "ollama-local", "none"])
+        idx = self.vision_engine.findText(self.cfg.get("vision_engine", "modlens"))
+        if idx >= 0: self.vision_engine.setCurrentIndex(idx)
+        form.addRow("Источник видения:", self.vision_engine)
+        self.vision_source = QComboBox()
+        self.vision_source.addItems(["gemini", "openai", "anthropic", "ollama-local"])
+        idx2 = self.vision_source.findText(self.cfg.get("vision_source", "gemini"))
+        if idx2 >= 0: self.vision_source.setCurrentIndex(idx2)
+        form.addRow("Провайдер ModLens:", self.vision_source)
+        self.vision_gemini_key = QLineEdit(self.cfg.get("vision_gemini_key", ""))
+        self.vision_gemini_key.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Gemini API key (бесплатно):", self.vision_gemini_key)
+        self.vision_openai_url = QLineEdit(self.cfg.get("vision_openai_url", "http://localhost:11434/v1"))
+        self.vision_openai_key = QLineEdit(self.cfg.get("vision_openai_key", ""))
+        self.vision_openai_model = QLineEdit(self.cfg.get("vision_openai_model", "qwen2.5vl:3b"))
+        self.vision_openai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("OpenAI-совместимый URL:", self.vision_openai_url)
+        form.addRow("OpenAI API key:", self.vision_openai_key)
+        form.addRow("OpenAI vision модель:", self.vision_openai_model)
+        self.vision_local_model = QLineEdit(self.cfg.get("vision_local_model", "qwen2.5vl:3b"))
+        form.addRow("Локальная Ollama vision модель:", self.vision_local_model)
+        lay.addLayout(form)
+        btns = QHBoxLayout()
+        test = QPushButton("Проверить видение")
+        test.clicked.connect(self._test_vision)
+        cfg_btn = QPushButton("Настроить ModLens")
+        cfg_btn.clicked.connect(self._apply_vision_config)
+        btns.addWidget(test)
+        btns.addWidget(cfg_btn)
+        btns.addStretch()
+        lay.addLayout(btns)
+        note = QLabel("Примечание: если используешь ModLens, сначала получи бесплатный ключ Gemini (https://aistudio.google.com) или установи Antigravity CLI. Для локального Ollama установи vision-модель (ollama pull qwen2.5vl:3b) и используй провайдер 'ollama-local'.")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        return w
+
+    def _apply_vision_config(self):
+        import subprocess
+        MODLENS = r"C:\Users\Maxim\.dsh\profiles\desktop\node_modules\@liustack\modlens\dist\main.js"
+        def run(args):
+            try:
+                subprocess.run(['node', MODLENS] + args, timeout=30, shell=False)
+            except Exception:
+                pass
+        src = self.vision_engine.currentText()
+        if src == "modlens":
+            psrc = self.vision_source.currentText()
+            if psrc == "gemini":
+                key = self.vision_gemini_key.text().strip()
+                if key:
+                    run(["config", "set", "gemini-api.apiKey", key])
+            elif psrc == "openai":
+                if self.vision_openai_url.text().strip():
+                    run(["config", "set", "openai.baseUrl", self.vision_openai_url.text().strip()])
+                if self.vision_openai_key.text().strip():
+                    run(["config", "set", "openai.apiKey", self.vision_openai_key.text().strip()])
+                if self.vision_openai_model.text().strip():
+                    run(["config", "set", "openai.model", self.vision_openai_model.text().strip()])
+        run(["doctor"])
+
+
+    def _test_vision(self):
+        import os, time
+        os.makedirs(os.path.expanduser(os.path.join("~","Pictures","Capri")), exist_ok=True)
+        from PIL import ImageGrab
+        path = os.path.join(os.path.expanduser("~"), "Pictures", "Capri", f"test_{int(time.time())}.png")
+        ImageGrab.grab(all_screens=True).save(path)
+        from vision import describe_image
+        txt = describe_image(path, kind="screen", local_ai_fallback=(self.capri.local if (self.capri.cfg.get("local_ai") and self.capri.local) else None))
+        from PySide6.QtWidgets import QMessageBox
+        if txt and not txt.startswith("No vision"):
+            QMessageBox.information(self, "Тест видения", f"Описание:\n{txt}")
+        else:
+            QMessageBox.warning(self, "Тест видения", (txt or "Нет результата.") + "\n\nНастройте ModLens или установите vision-модель Ollama.")
+
     def _lists_tab(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -653,6 +737,13 @@ class SettingsDialog(QDialog):
         updates["steam_friends"] = steam_friends
 
         scenarios = {}
+        updates["vision_engine"] = self.vision_engine.currentText()
+        updates["vision_source"] = self.vision_source.currentText()
+        updates["vision_gemini_key"] = self.vision_gemini_key.text().strip()
+        updates["vision_openai_url"] = self.vision_openai_url.text().strip()
+        updates["vision_openai_key"] = self.vision_openai_key.text().strip()
+        updates["vision_openai_model"] = self.vision_openai_model.text().strip()
+        updates["vision_local_model"] = self.vision_local_model.text().strip()
         for r in range(self.scenarios_table.rowCount()):
             a = self.scenarios_table.item(r, 0)
             b = self.scenarios_table.item(r, 1)
@@ -761,6 +852,14 @@ class SettingsDialog(QDialog):
                 pass
             from PySide6.QtWidgets import QMessageBox
             self.status_label.setText("Применено. Часть настроек вступит после перезапуска.")
+            for vk in ("vision_engine","vision_source","vision_gemini_key","vision_openai_url","vision_openai_key","vision_openai_model","vision_local_model"):
+                if vk in updates:
+                    capri.cfg[vk] = updates[vk]
+                    try:
+                        from main import save_setting
+                        save_setting(vk, updates[vk])
+                    except Exception:
+                        pass
             self.status_label.setStyleSheet("color: #28ff96;")
             QMessageBox.information(self, "Капри", "Настройки применены. Некоторые из них вступят в силу после перезапуска Капри.")
         except Exception as e:

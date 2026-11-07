@@ -21,6 +21,7 @@ import automation
 import media
 import steam
 import games
+import vision
 import commentary
 import freestyle
 import learning
@@ -1055,6 +1056,7 @@ class Actions:
              r"(?P<q>.+)$", self.video),
             (r"^(открой|включи|покажи|запусти|поставь)( мне)? (на|в) (ютуб\w*|youtube) (?P<q>.+)$", self.video),
             (r"^(найди|поищи|загугли|погугли|ищи)( в интернете| в гугле| в google)? (?P<q>.+)$", self.search),
+            (r"^(опиши|что (на|в)|проанализируй|расскажи (про|о))( мне)? (картинк\w*|фото\w*|изображени\w*|экран|screen|image)(\s+(?P<path>.+))?$", self.describe_picture),
             (r"^(открой|запусти|включи|зайди на|перейди на|покажи) (?P<t>.+)$", self.open),
             (r"^((сними|снять) (задачу|процесс\w*)|(заверши|завершить|убей|убить|останови|закрой) "
              r"(все )?(процесс\w*|задачу|задачи)|кильни|килльни|грохни|прибей) (?P<t>.+)$", self.kill_process),
@@ -1071,6 +1073,10 @@ class Actions:
         ]
 
     def handle(self, cmd):
+        m_img = re.match(r'^(опиши|что (на|в)|проанализируй|расскажи (про|о))( мне)? (картинк\w*|фото\w*|изображени\w*|экран|screen|image)(\s+(?P<path>.+))?\s*$', cmd, re.I)
+        log.info("DBG handle cmd=%r m_img=%s", cmd, m_img.groupdict() if m_img else None)
+        if m_img:
+            return self.describe_picture(cmd, m_img)
         c = norm(cmd)
         cancel_ensure()  # новая команда — старая проверка «заиграло ли видео» больше не нужна
         if self.pending:
@@ -2183,21 +2189,48 @@ class Actions:
     def look_cmd(self, kind):
         """«прокомментируй обои» / «прокомментируй экран»: посмотреть (локальная модель с «глазами») и сказать своё.
         По просьбе — всегда, независимо от настроек комментариев."""
-        if not self.local:
-            return Reply(line("look_no_model"))
+        ai = None
+        if self.cfg.get("local_ai") and self.local:
+            ai = self.local
+        elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            ai = self.ai
+        low_kind = (kind or "screen").lower()
+        import os as _os, time as _time
+        from PIL import ImageGrab as _IG
+        if low_kind == "wallpaper":
+            path = freestyle.wallpaper_path()
+            if not path:
+                return Reply(line("look_fail"))
+        else:
+            folder = _os.path.join(_os.path.expanduser("~"), "Pictures", "Capri")
+            _os.makedirs(folder, exist_ok=True)
+            path = _os.path.join(folder, f"look_{int(_time.time())}.png")
+            _IG.grab(all_screens=True).save(path)
         try:
-            what = freestyle.describe(self.local, kind)
-        except freestyle.NoVision:
-            return Reply(line("look_no_model"))
+            log.info("DESCPIC attempt")
+            from vision import describe_image
+            what = describe_image(path, kind=low_kind, local_ai_fallback=ai)
         except Exception:
             log.exception("Не смогла посмотреть (%s)", kind)
             return Reply(line("look_fail"))
+        if not what or what.startswith("No vision provider") or what.startswith("Не удалось"):
+            return Reply("Нет настроенного источника vision. Укажи ключ для ModLens (Gemini/OpenAI/Anthropic) или установи локальную Ollama-модель с глазами (например, qwen2.5vl:3b).")
         if not what:
             return Reply(line("look_fail"))
-        detail = {"what": what}
-        if self.commentator:
-            return Reply(self.commentator.render(kind, detail, self.local.quip, line))
-        return Reply(commentary.compose(kind, detail, self.local.quip, line, rude=bool(self.cfg.get("profanity"))))
+        detail = {"what": what, "_source_path": path}
+        if self.commentator and ai:
+            try:
+                return Reply(self.commentator.render(low_kind if low_kind in {"wallpaper", "screen"} else "screen", detail, (ai.quip if ai else None), line))
+            except Exception:
+                pass
+        prompt = f"Пользователь просит воспринять картинку. Vision-описание: {what}. Ответь от лица Капри кратко и с характером."
+        if self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            answer = self.ai.ask(prompt)
+        elif self.cfg.get("local_ai") and self.local:
+            answer = self.local.ask(prompt)
+        else:
+            answer = what
+        return Reply(answer if answer else what)
 
     def _outcome_cmd(self, kind):
         """«я слил» / «ура, прошёл»: стёб, подбадривание или похвала — по тому, что заходит. Если подколки выключены,
@@ -2355,6 +2388,55 @@ class Actions:
             return Reply(line("game_launch_fail", t=g["name"]))
         subprocess.Popen([g["exe"]], cwd=os.path.dirname(g["exe"]))
         return Reply(line("game_launch", t=g["name"]))
+
+    def describe_picture(self, c, m):
+        log.info("DESCPIC BEGIN c=%r", c)
+        import base64 as _b64, os as _os, re as _re, time as _time
+        from PIL import ImageGrab as _ImageGrab
+        low = c.lower()
+        path = (m.groupdict().get("path") or "").strip().strip('"').strip()
+        if not path and _os.path.exists(c):
+            cand = _re.findall(r"[A-Za-z]:\\\\[^\\s\"']+", c)
+            if cand:
+                path = cand[-1]
+        screenish = any(w in low for w in ("экран", "screen", "обои", "wallpaper"))
+        use_screenshot = False
+        if (not path) or screenish:
+            folder = _os.path.join(_os.path.expanduser("~"), "Pictures", "Capri")
+            _os.makedirs(folder, exist_ok=True)
+            path = _os.path.join(folder, f"look_{int(_time.time())}.png")
+            _ImageGrab.grab(all_screens=True).save(path)
+            use_screenshot = True
+        if not _os.path.exists(path):
+            return Reply("Не нашла этот файл. Укажи полный путь к картинке или напиши «опиши экран».")
+        if self.cfg.get("local_ai") and self.local:
+            ai = self.local
+        elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            ai = self.ai
+        else:
+            ai = None
+        try:
+            desc = vision.describe_image(path, kind=("wallpaper" if "обои" in low else "screen"), local_ai_fallback=ai)
+            log.info("DESCPIC desc=%r", (desc or "")[:80])
+        except Exception as e:
+            import traceback; traceback.print_exc(); return Reply(f"Описание картинки не получилось: {e}")
+        txt = desc if desc else "Не удалось рассмотреть картинку."
+        detail = {"what": txt, "_source_path": path}
+        if self.commentator and ai and not (txt.startswith("No vision provider") or txt.startswith("Failed to describe")):
+            try:
+                return Reply(self.commentator.render(kind if kind in {"wallpaper", "screen"} else "screen", detail, ai.quip if ai else None, line))
+            except Exception:
+                pass
+        if txt.startswith("No vision provider") or txt.startswith("Failed to describe"):
+            return Reply(txt)
+        prompt = "Пользователь просит воспринять картинку. Vision-описание: " + txt + ". Ответь от лица Капри кратко и с характером."
+        if self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            answer = self.ai.ask(prompt)
+        elif self.cfg.get("local_ai") and self.local:
+            answer = self.local.ask(prompt)
+        else:
+            answer = txt
+        return Reply(answer if answer else txt)
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):
