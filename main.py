@@ -776,6 +776,7 @@ class Capri(QObject):
             return
         if kind == "chatter":
             text = self.chatter_line()
+            self._play_fx("tada" if random.random() < 0.45 else "sway")
             if random.random() < self.cfg.get("roam_chance", 0.5):
                 self.roam.emit()          # гуляет по экрану, окно с текстом сверху
                 time.sleep(1.5)
@@ -783,6 +784,8 @@ class Capri(QObject):
                 self.summon.emit()
             if not self.say(text):
                 self.mode.emit("idle", 0.0)
+            else:
+                self._play_fx("pop")
             return
         self.last_activity = time.time()
         if kind == "say":
@@ -794,12 +797,16 @@ class Capri(QObject):
                 return
             if not self.say(job[1]):
                 self.mode.emit("idle", 0.0)
+            else:
+                self._play_fx("bounce")
             return
         if kind == "voice":
             _, cmd, audio, woke = job
             self.summon.emit()
             self.mode.emit("thinking", 0.0)
             self.subtitle.emit("> " + cmd)
+            self._play_fx("sway")
+
             if self.cfg.get("use_google_stt"):
                 better = google_stt(audio)
                 if better:
