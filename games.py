@@ -54,6 +54,7 @@ KNOWN = {
     "valorant-win64-shipping.exe": "Valorant", "leagueoflegends.exe": "League of Legends",
     "fortniteclient-win64-shipping.exe": "Fortnite", "gta5.exe": "GTA 5", "eldenring.exe": "Elden Ring",
     "witcher3.exe": "The Witcher 3", "robloxplayerbeta.exe": "Roblox", "minecraft.exe": "Minecraft",
+    "cyberpunk2077.exe": "Cyberpunk 2077",
     "overwatch.exe": "Overwatch", "r5apex.exe": "Apex Legends", "tslgame.exe": "PUBG",
     "stardew valley.exe": "Stardew Valley", "hollow knight.exe": "Hollow Knight",
 }

@@ -389,6 +389,10 @@ class Capri(QObject):
     def chatter_line(self):
         hour = time.localtime().tm_hour
         text = None
+        current = self.actions.games.current()
+        game = self.actions.games.get(current) if current else None
+        if game and "cyberpunk" in (game.get("name") or "").lower() and random.random() < 0.55:
+            return line("game_cyberpunk_play")
         if 0 <= hour < 5 and random.random() < 0.5:
             text = line("chatter_night")
         elif 6 <= hour < 11 and random.random() < 0.3:
@@ -704,9 +708,15 @@ class Capri(QObject):
         """Трекер игр (его поток): Капри говорит только когда игра закрылась, поверх игры не лезет.
         Подколка («слил», марафон) важнее обычного «наиграл N минут»; первое знакомство с игрой — не стебём."""
         first = key in self.actions.game_announce
+        g = self.actions.games.get(key)
+        is_cyb = bool(g) and "cyberpunk" in (g.get("name") or "").lower()
         text = self.actions.on_game_event(kind, key, minutes)
+        if is_cyb and kind == "start" and first:
+            self.jobs.put(("say", line("game_cyberpunk_start")))
+        if is_cyb and kind == "end":
+            self.jobs.put(("say", line("game_cyberpunk_end")))
         found = self.commentator.on_game_event(kind, key, minutes)
-        if found and not first:
+        if found and not first and not is_cyb:
             self.jobs.put(("roast",) + found)
         elif text:
             self.jobs.put(("say", text))
