@@ -2190,7 +2190,19 @@ class Actions:
         """«прокомментируй обои» / «прокомментируй экран»: посмотреть (локальная модель с «глазами») и сказать своё.
         По просьбе — всегда, независимо от настроек комментариев."""
         ai = None
-        if self.cfg.get("local_ai") and self.local:
+        if self.cfg.get("vision_engine") == "ollama-local":
+            try:
+                if self.local is None:
+                    from local_ai import LocalAI
+                    self.local = LocalAI(self.cfg)
+                try:
+                    self.local.start_server()
+                except Exception:
+                    pass
+                ai = self.local
+            except Exception:
+                ai = None
+        elif self.cfg.get("local_ai") and self.local:
             ai = self.local
         elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
             ai = self.ai
@@ -2213,8 +2225,8 @@ class Actions:
         except Exception:
             log.exception("Не смогла посмотреть (%s)", kind)
             return Reply(line("look_fail"))
-        if not what or what.startswith("No vision provider") or what.startswith("Не удалось"):
-            return Reply("Нет настроенного источника vision. Укажи ключ для ModLens (Gemini/OpenAI/Anthropic) или установи локальную Ollama-модель с глазами (например, qwen2.5vl:3b).")
+        if not what or what.startswith(("No vision provider", "Failed to describe", "Локальная vision-модель")):
+            return Reply(what)
         if not what:
             return Reply(line("look_fail"))
         detail = {"what": what, "_source_path": path}
@@ -2409,7 +2421,19 @@ class Actions:
             use_screenshot = True
         if not _os.path.exists(path):
             return Reply("Не нашла этот файл. Укажи полный путь к картинке или напиши «опиши экран».")
-        if self.cfg.get("local_ai") and self.local:
+        if self.cfg.get("vision_engine") == "ollama-local":
+            try:
+                if self.local is None:
+                    from local_ai import LocalAI
+                    self.local = LocalAI(self.cfg)
+                try:
+                    self.local.start_server()
+                except Exception:
+                    pass
+                ai = self.local
+            except Exception:
+                ai = None
+        elif self.cfg.get("local_ai") and self.local:
             ai = self.local
         elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
             ai = self.ai
@@ -2422,7 +2446,7 @@ class Actions:
             import traceback; traceback.print_exc(); return Reply(f"Описание картинки не получилось: {e}")
         txt = desc if desc else "Не удалось рассмотреть картинку."
         detail = {"what": txt, "_source_path": path}
-        if self.commentator and ai and not (txt.startswith("No vision provider") or txt.startswith("Failed to describe")):
+        if self.commentator and ai and not (txt.startswith("No vision provider") or txt.startswith("Failed to describe") or txt.startswith("Локальная vision-модель")):
             try:
                 return Reply(self.commentator.render(kind if kind in {"wallpaper", "screen"} else "screen", detail, ai.quip if ai else None, line))
             except Exception:
