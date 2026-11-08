@@ -9,6 +9,14 @@ REST = Pose(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, False)
 
 DURATION = {"bounce": 1.3, "shake": 1.0, "pulse": 1.1, "flip": 1.0, "droop": 1.8}
 
+_BOUNCE_SIGN = 1
+
+
+def set_bounce_direction(sign):
+    """Направление инерции для анимации bounce: -1 влево, +1 вправо."""
+    global _BOUNCE_SIGN
+    _BOUNCE_SIGN = -1 if sign < 0 else 1
+
 # какая ситуация комментатора какую анимацию запускает (None — без анимации)
 FOR_SITUATION = {
     "win": "bounce", "streak_win": "flip", "loss": "shake", "streak_loss": "droop",
@@ -36,13 +44,16 @@ def sample(name, t, h=380.0):
         return REST
     k = t / d
     fade = 1 - k
-    if name == "bounce":          # три затухающих прыжка с приседанием перед ними
-        n = 3
-        ph = (k * n) % 1.0
-        amp = (1 - k * .65) * h * .09
-        up = math.sin(ph * math.pi)
-        squash = 1 + .06 * math.cos(ph * 2 * math.pi) * fade
-        return Pose(0, -amp * up, 1 / squash, squash, math.sin(k * math.pi * 6) * .03 * fade, 0.0, False)
+    if name == "bounce":          # инерция после перетаскивания: смещение с overshoot, затухающее к концу
+        sg = _BOUNCE_SIGN
+        # 0 → пик к середине → 0: по инерции ещё чуть дальше, потом возврат на место
+        ease = math.sin(k * math.pi) * (1.0 - 0.35 * k)
+        dx = sg * ease * 38.0
+        dy = -abs(math.sin(k * math.pi)) * 12 * (1.0 - k)
+        squash = 1 + 0.05 * math.cos(k * math.pi * 2) * (1.0 - k)
+        rot = sg * math.sin(k * math.pi) * 0.045 * (1.0 - k)
+        glitch = 0.12 * fade
+        return Pose(dx, dy, 1.0 / squash, squash, rot, glitch, False)
     if name == "shake":           # быстрая дрожь с глитчем и красной вспышкой в начале
         dx = math.sin(t * 70) * 11 * fade
         return Pose(dx, math.sin(t * 53) * 3 * fade, 1.0, 1.0, math.sin(t * 61) * .04 * fade,

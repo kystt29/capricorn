@@ -840,8 +840,11 @@ class Capri(QObject):
                 reply = Reply(answer, "answer") if answer else self.actions.fallback(cmd, force_search=bool(self.local))
         if reply.action == "answer" and self.cfg.get("teleport_on_answer"):
             self.hop.emit()  # отвечает, скача по экрану красной молнией
-        if reply.action == "wave":
+        if reply.action and reply.action.startswith("fx:"):
+            self._play_fx(reply.action[3:])
+        elif reply.action == "wave":
             self.anim.emit("capri")
+            self._play_fx("bounce")
         elif reply.action and reply.action.startswith("move:"):
             self.move_to.emit(reply.action[5:])
         elif reply.action == "roam":

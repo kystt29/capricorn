@@ -500,6 +500,8 @@ class Avatar(QWidget):
         self.user_moved = False
         self._press = None
         self._moved = False
+        self._drag_dir = 0
+        self._drag_last = None
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -955,18 +957,34 @@ class Avatar(QWidget):
             self.stop_roam()
             self._press = e.globalPosition().toPoint() - self.pos()
             self._moved = False
+            self._drag_dir = 0
+            self._drag_last = e.globalPosition().toPoint()
+            self.play_effect("pulse")
         elif e.button() == Qt.MouseButton.RightButton:
             self.menu_requested.emit(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e):
         if self._press is not None:
-            self.move(e.globalPosition().toPoint() - self._press)
+            new_pos = e.globalPosition().toPoint()
+            try:
+                dx = new_pos.x() - self._drag_last.x()
+                if dx != 0:
+                    self._drag_dir = 1 if dx > 0 else -1
+            except AttributeError:
+                self._drag_dir = 0
+            self._drag_last = new_pos
+            self.move(new_pos - self._press)
             self.hopping, self.hop_home = False, None
             self._moved = True
             self.user_moved = True
+            if not self._moved or self.t % 6 == 0:
+                self.play_effect("shake")
 
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             if not self._moved:
                 self.clicked.emit()
+            else:
+                effects.set_bounce_direction(self._drag_dir or 1)
+                self.play_effect("bounce")
             self._press = None
