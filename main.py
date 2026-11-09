@@ -563,6 +563,53 @@ class Capri(QObject):
         self.screen.broken = False
         log.info("Реакции по экрану: %s", "включены" if on else "выключены")
 
+    def open_import_config_dialog(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(None, "Импортировать конфиг другой Капри", "",
+                                              "Файл конфига (config.json *.json);;Все файлы (*.*)")
+        if path:
+            msg = self.import_config(path)
+            self.jobs.put(("say", msg))
+
+    def import_config(self, path):
+        """Импортировать сайты, программы, свои ответы и базовые настройки из config другой Капри.
+        Данные сливаем, не затирая встроенные настройки. Возвращает краткий результат."""
+        import os
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception as e:
+            return "Не удалось прочитать этот конфиг: " + str(e)
+        if not isinstance(data, dict):
+            return "Этот файл не похож на config Капри."
+        site_keys = ("sites", "apps", "app_aliases", "replies")
+        merged_keys = []
+
+        def change(existing):
+            for key, value in data.items():
+                if key in site_keys and isinstance(value, dict):
+                    existing.setdefault(key, {})
+                    existing[key].update(value)
+                    merged_keys.append(key)
+                elif key in existing and isinstance(existing[key], dict) and isinstance(value, dict):
+                    existing[key].update(value)
+                    merged_keys.append(key)
+                elif value is not None:
+                    existing[key] = value
+                    merged_keys.append(key)
+            for key in ("user_name_mode", "user_name", "user_gender"):
+                if key in data:
+                    existing[key] = data[key]
+        err = _edit_config(change)
+        if err:
+            return "Импорт не применился: " + err
+        try:
+            self.reload_config_if_changed(speak=False)
+        except Exception:
+            pass
+        keys = ", ".join(sorted(set(merged_keys))) or "базовые настройки"
+        return (f"Конфиг импортирован, слито: {keys}. Капри перечитала список, проверь Настройки.")
+
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
         self.cfg["chatter"] = bool(on)
@@ -831,6 +878,9 @@ class Capri(QObject):
         self.reload_config_if_changed()
 
         reply = self.actions.handle(cmd)
+        if reply is not None and reply.action == "import_config":
+            self.open_import_config_dialog()
+            return
         if reply is not None and reply.action in ("mic_info", "mic_next"):
             reply = self.mic_command(reply.action)
         elif reply is not None and reply.action and reply.action.startswith("commentary:"):
@@ -999,6 +1049,17 @@ def main():
         capri.reload_config_if_changed(speak=False)
         show_window("settings", lambda: SettingsDialog(capri))
 
+    def open_import_config():
+        from PySide6.QtWidgets import QFileDialog
+        import os
+        path, _ = QFileDialog.getOpenFileName(None, "Импортировать конфиг другой Капри", "",
+                                              "config.json (config.json *.json);;Все файлы (*.*)")
+        if not path:
+            return
+        msg = capri.import_config(path)
+        capri.jobs.put(("say", msg))
+        log.info("Импорт конфига: %s — %s", path, msg)
+
     menu = QMenu()
     for title, fn in (("Позвать Капри", capri.call_from_click),
                       ("Замолчать", capri.interrupt),
@@ -1006,6 +1067,7 @@ def main():
                       ("Мои сайты, программы и ответы…", open_entries),
                       ("Очистить историю ИИ", lambda: capri.clear_ai_history()),
                        ("Настройки…", open_settings),
+                       ("Импортировать конфиг из другой Капри…", open_import_config),
                       ("Как ко мне обращаться…", open_profile),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
 ("Настройки микрофона Windows", lambda: os.startfile("ms-settings:privacy-microphone")),
