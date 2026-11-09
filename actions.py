@@ -19,7 +19,13 @@ import psutil
 
 import automation
 import media
-from persona import line
+import steam
+import games
+import vision
+import commentary
+import freestyle
+import learning
+from persona import line, CONTEXT_PROVIDERS, TOPIC_PROVIDERS
 
 log = logging.getLogger("capri")
 NO_WINDOW = 0x08000000
@@ -916,7 +922,7 @@ FORGET_RE = (r"^(забудь|удали|убери)( мой| мою| из па�
              r"приложени\w*|игр\w*) (?P<name>.+)$")
 
 
-CAPRI_URL = "https://github.com/kystt29/capricorn"
+CAPRI_URL = "https://github.com/plumcat5169/capricorn"
 # «есть обновления?», «где скачать новую версию», «твой гитхаб» — страница Капри (не «обнови страницу»)
 UPDATES_RE = (r"^(есть |проверь |проверить |какие |когда |а )?(новые )?обновлени\w*( есть| вышли| для тебя| капри)?$|"
               r"(есть|проверь|проверить|вышл\w*|появил\w*|скачать|где|какие|нет ли)\b.*\bобновлени|"
@@ -949,7 +955,29 @@ class Actions:
         self.youtube_opened_at = 0.0  # когда Капри последний раз открывала YouTube
         self.media_paused = None      # какой плеер Капри поставила на паузу
         self.local = None
+        self.games = games.GameBook(os.path.join(base_dir, "games.json"), norm, translit)
+        self.game_announce = set()
+        self.game_spoke_at = 0.0
+        CONTEXT_PROVIDERS.append(self.games.summary)
+        TOPIC_PROVIDERS.append(self.games.chatter_topics)
         self.routes = [
+            (freestyle.ANYTIME_RE, self.anytime_toggle),
+            (freestyle.PROFANITY_RE, self.profanity_toggle),
+            (freestyle.WALLPAPER_RE, lambda c, m: self.look_cmd("wallpaper")),
+            (freestyle.SCREEN_RE, lambda c, m: self.look_cmd("screen")),
+            (commentary.TOGGLE_RE, self.commentary_toggle),
+            (learning.LIKE_RE, self.feedback_like),
+            (learning.DISLIKE_RE, self.feedback_dislike),
+            (commentary.WIN_RE, self.win_cmd),
+            (commentary.LOSS_RE, self.loss_cmd),
+            (steam.SEND_RE, self.steam_message),  # до обычной печати «напиши …»
+            # --- игры: раньше «запомни …», иначе игра запомнилась бы как программа ---
+            (games.TEACH_RE, self.game_teach),
+            (games.FORGET_RE, self.game_forget),
+            (games.NOTE_RE, self.game_note),
+            (games.INFO_RE, self.game_info),
+            (games.TIME_RE, self.game_time),
+            (games.LAUNCH_RE, self.game_launch),
             (r"^(выход|выключись|отключись|заверши работу|завершить работу)$", self.quit),
             (r"^(спрячься|скройся|исчезни|пока|отбой|свободна)\b|"
              r"^(уйди|уходи|убирайся|свали|сгинь|испарись|скрой себя|убери себя)\b|"
@@ -1028,11 +1056,16 @@ class Actions:
              r"(?P<q>.+)$", self.video),
             (r"^(открой|включи|покажи|запусти|поставь)( мне)? (на|в) (ютуб\w*|youtube) (?P<q>.+)$", self.video),
             (r"^(найди|поищи|загугли|погугли|ищи)( в интернете| в гугле| в google)? (?P<q>.+)$", self.search),
+            (r"^(опиши|что (на|в)|проанализируй|расскажи (про|о))( мне)? (картинк\w*|фото\w*|изображени\w*|экран|screen|image)(\s+(?P<path>.+))?$", self.describe_picture),
             (r"^(открой|запусти|включи|зайди на|перейди на|покажи) (?P<t>.+)$", self.open),
             (r"^((сними|снять) (задачу|процесс\w*)|(заверши|завершить|убей|убить|останови|закрой) "
              r"(все )?(процесс\w*|задачу|задачи)|кильни|килльни|грохни|прибей) (?P<t>.+)$", self.kill_process),
             (r"что (сейчас )?(грузит|нагружает|жрет|ест|тормозит)|(какие|какой) процесс\w* (грузят|нагружают|жрут|"
              r"тормозят)|самые (тяжелые|прожорливые) процессы", self.top_processes),
+            (r"(батарея|заряд (аккумулятора|батареи)|аккумулятор)", self.battery),
+            (r"(свободное место|свободно на диске|место на диске|проверь диск|проверка диска|что на диске|состояние диска|проверь c)", self.disk_space),
+            (r"(скорость интернета|скорость сети|пинг|проверь интернет|проверь сеть|интернет скорость)", self.network_speed),
+            (r"(игровой режим|режим игры|игровой профиль|обычный режим|выключить игровой режим)", self.game_mode),
             (r"^(закрой|заверши|выключи|убей) (?P<t>.+)$", self.close),
             (r"который час|сколько времени|сколько сейчас времени|время сейчас", self.time),
             (r"какое (сегодня )?число|какая (сегодня )?дата|какой сегодня день", self.date),
@@ -1040,6 +1073,10 @@ class Actions:
         ]
 
     def handle(self, cmd):
+        m_img = re.match(r'^(опиши|что (на|в)|проанализируй|расскажи (про|о))( мне)? (картинк\w*|фото\w*|изображени\w*|экран|screen|image)(\s+(?P<path>.+))?\s*$', cmd, re.I)
+        log.info("DBG handle cmd=%r m_img=%s", cmd, m_img.groupdict() if m_img else None)
+        if m_img:
+            return self.describe_picture(cmd, m_img)
         c = norm(cmd)
         cancel_ensure()  # новая команда — старая проверка «заиграло ли видео» больше не нужна
         if self.pending:
@@ -1063,6 +1100,64 @@ class Actions:
             if re.match(r"^(никак\w*|ни одно|ни то|отмена|не надо|нет|ничего)\b", c):
                 return Reply(line("cancel"))
             # ответ не про выбор — значит, это новая команда
+        # --- сценарии: несколько команд по одному имени ---
+        scen_forget = re.match(r"^забудь\s+сценарий\s+(?P<name>.+)$", c)
+        if scen_forget:
+            name = scen_forget.group("name").strip()
+            if self.cfg.get("scenarios", {}).pop(name, None) is not None:
+                try:
+                    import main as _m
+                    _m.save_setting("scenarios", self.cfg.get("scenarios", {}))
+                except Exception:
+                    pass
+                return Reply(f"Забыла сценарий «{name}».")
+            return Reply(f"Сценария «{name}» не было.")
+        # Permite que el usuario enseñe sin dos puntos: «сценарий trabajo bloque nota vscode».
+        scen_teach2 = re.match(r"^(?:научи\s+)?сценарий\s+(?P<name>\S+)\s+(?P<items>.+)$", c)
+        if scen_teach2:
+            name = scen_teach2.group("name").strip().strip(":-")
+            raw_items = scen_teach2.group("items").strip().lstrip(":-").strip()
+            items = [x.strip() for x in raw_items.replace(" и ", ",").split(",") if x.strip()]
+            if not items or len(items) == 1 and " " in items[0]:
+                items = [x for x in raw_items.split() if x.strip()]
+            if items:
+                self.cfg.setdefault("scenarios", {})[name] = items
+                try:
+                    import main as _m
+                    _m.save_setting("scenarios", self.cfg["scenarios"])
+                except Exception:
+                    pass
+                return Reply(f"Запомнила сценарий «{name}»: {', '.join(items)}.")
+
+        scen_list = re.match(r"^(?:покажи\s+|мои\s+)?сценари(?:й|и)$", c)
+        if scen_list:
+            names = sorted(self.cfg.get("scenarios", {}).keys())
+            if not names:
+                return Reply("Сценариев пока нет. Научи: «сценарий работа: браузер, вс код, телеграм».")
+            return Reply("Сценарии: " + ", ".join(names) + ".")
+
+        scen_run = re.match(r"^(?:запусти\s+)?сценарий\s+(?P<name>.+)$", c)
+        if scen_run:
+            requested = scen_run.group("name").strip()
+            items = self.cfg.get("scenarios", {}).get(requested)
+            if items is None and " " in requested:
+                first = requested.split()[0]
+                items = self.cfg.get("scenarios", {}).get(first)
+                requested = first if items is not None else requested
+            if items:
+                notes = []
+                for item in items:
+                    try:
+                        r = self.handle_one(f"открой {item}")
+                        if r and r.text:
+                            notes.append(r.text)
+                    except Exception:
+                        pass
+                return Reply(f"Запускаю сценарий «{requested}»: {', '.join(notes) if notes else 'готово'}.")
+            return Reply(f"Сценария «{requested}» не знаю. Научи: «сценарий {requested}: браузер, вс код».")
+
+        custom = self.custom_reply(c)  # своя фраза целиком — не делим её на цепочку команд
+
         custom = self.custom_reply(c)  # своя фраза целиком — не делим её на цепочку команд
         if custom:
             return custom
@@ -1958,6 +2053,414 @@ class Actions:
         path = os.path.join(folder, f"screen_{datetime.datetime.now():%Y%m%d_%H%M%S}.png")
         ImageGrab.grab(all_screens=True).save(path)
         return Reply(line("screenshot"))
+
+    def battery(self, c, m):
+        try:
+            import psutil
+        except Exception:
+            return Reply(line("error", e="нет psutil"))
+        b = psutil.sensors_battery()
+        if b is None:
+            return Reply(line("battery_none"))
+        pct = round(b.percent)
+        state = "заряжается" if b.power_plugged else "разряжается"
+        secs = b.secsleft if b.secsleft and b.secsleft > 0 else None
+        extra = (", осталось примерно " + str(secs // 60) + " мин.") if secs else ""
+        if pct < 20:
+            text = line("battery_low", pct=pct)
+        elif pct > 80:
+            text = line("battery_high", pct=pct)
+        else:
+            text = line("battery_mid", pct=pct)
+        return Reply(f"{text} Сейчас {state}{extra}.")
+
+    def disk_space(self, c, m):
+        try:
+            import psutil
+        except Exception:
+            return Reply(line("error", e="нет psutil"))
+        parts = []
+        stats = []
+        for d in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(d.mountpoint)
+            except (PermissionError, OSError):
+                continue
+            total, used, free = u.total // (1024**3), u.used // (1024**3), u.free // (1024**3)
+            pct_free = (free / total * 100) if total else 100
+            parts.append(d.device + ": свободно " + str(free) + " из " + str(total) + " ГБ (занято " + str(used) + " ГБ).")
+            stats.append((d.device, free, total, pct_free))
+        if not parts:
+            return Reply("Не удалось прочитать информацию о дисках.")
+        primary = next((x for x in stats if x[0].upper().startswith("C:")), (stats[0] if stats else None))
+        free, total, pct_free = (primary[1], primary[2], primary[3]) if primary else (0, 0, 100)
+        if pct_free < 8:
+            text = line("disk_critical", free=free, total=total)
+        elif pct_free < 25:
+            text = line("disk_warn", free=free, total=total)
+        else:
+            text = line("disk_ok", free=free, total=total)
+        return Reply(text + " " + " ".join(parts))
+
+    def network_speed(self, c, m):
+        import time
+        import urllib.request
+        start = time.time()
+        try:
+            urllib.request.urlopen("https://www.google.com", timeout=5)
+            ping_ms = (time.time() - start) * 1000
+        except Exception:
+            return Reply(line("net_offline"))
+        try:
+            t0 = time.time()
+            with urllib.request.urlopen("http://speed.cloudflare.com/__down?bytes=1000000", timeout=15) as r:
+                data = r.read()
+            elapsed = max(time.time() - t0, 0.01)
+            mbps = len(data) * 8 / elapsed / 1_000_000
+            if ping_ms > 350 or mbps < 5:
+                return Reply(line("net_slow", ping=round(ping_ms), speed=round(mbps, 1)))
+            return Reply(line("net_fast", ping=round(ping_ms), speed=round(mbps, 1)))
+        except Exception:
+            return Reply(line("net_offline") if False else "Интернет есть: пинг " + str(round(ping_ms)) + " мс, но скорость не измерилась.")
+
+    def game_mode(self, c, m):
+        if re.search(r"(обычн|выкл|сними|отключи).*(режим)|(режим).*(выкл|обычн|сними|отключи)", c):
+            self.cfg["chatter"] = True
+            try:
+                import main as _m
+                _m.save_setting("chatter", True)
+            except Exception:
+                pass
+            return Reply(line("game_mode_off"))
+        self.cfg["chatter"] = False
+        try:
+            import main as _m
+            _m.save_setting("chatter", False)
+        except Exception:
+            pass
+        return Reply(line("game_mode_on"))
+
+    def steam_message(self, c, m):
+        """«напиши Васе в стиме, что я опоздаю» — находит друга, читает текст вслух и после «да» отправляет."""
+        friends = steam.load_friends(self.cfg.get("steam_path", ""))
+        aliases = self.cfg.get("steam_friends") or {}
+
+        def find(query):
+            return steam.find_friend(query, friends, aliases, norm, translit)
+        if not friends and not aliases:
+            return Reply(line("steam_no_friends"))
+        parsed = steam.parse(c, find)
+        if parsed is None:
+            return None
+        kind, who, text = parsed
+        if kind == "no_friend":
+            return Reply(line("steam_no_friend", t=who or "без имени"))
+        _, steam64, label = who
+        if kind == "no_text":
+            return Reply(line("steam_no_text", who=label))
+        if not steam.is_running():
+            return Reply(line("steam_not_running"))
+
+        def do():
+            if not steam.send_message(steam64, label, text):
+                return Reply(line("steam_chat_fail", who=label))
+            return Reply(line("steam_sent", who=label, t=text))
+        if self.cfg.get("steam_confirm", True):
+            self.pending = do  # дальше handle() ждёт «да»
+            return Reply(line("steam_ask", who=label, t=text))
+        return do()
+
+    # --- подколки (наблюдатель — в commentary.py) ---
+    def commentary_toggle(self, c, m):
+        """«не комментируй» / «комментируй меня»: включает и выключает подколки (само переключение делает main)."""
+        off = commentary.toggle_wants_off(c)
+        return Reply(line("commentary_off" if off else "commentary_on"), "commentary:" + ("off" if off else "on"))
+
+    def anytime_toggle(self, c, m):
+        """«комментируй всё» / «выключи свободный режим» (само переключение делает main)."""
+        off = bool(re.search(freestyle.ANYTIME_OFF, c))
+        return Reply(line("anytime_off" if off else "anytime_on"), "anytime:" + ("off" if off else "on"))
+
+    def profanity_toggle(self, c, m):
+        """«ругайся» / «не матерись» (само переключение делает main)."""
+        off = bool(re.search(freestyle.PROFANITY_OFF, c))
+        return Reply(line("profanity_off" if off else "profanity_on"), "profanity:" + ("off" if off else "on"))
+
+    def look_cmd(self, kind):
+        """«прокомментируй обои» / «прокомментируй экран»: посмотреть (локальная модель с «глазами») и сказать своё.
+        По просьбе — всегда, независимо от настроек комментариев."""
+        ai = None
+        if self.cfg.get("vision_engine") == "ollama-local":
+            try:
+                if self.local is None:
+                    from local_ai import LocalAI
+                    self.local = LocalAI(self.cfg)
+                try:
+                    self.local.start_server()
+                except Exception:
+                    pass
+                ai = self.local
+            except Exception:
+                ai = None
+        elif self.cfg.get("local_ai") and self.local:
+            ai = self.local
+        elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            ai = self.ai
+        low_kind = (kind or "screen").lower()
+        import os as _os, time as _time
+        from PIL import ImageGrab as _IG
+        if low_kind == "wallpaper":
+            path = freestyle.wallpaper_path()
+            if not path:
+                return Reply(line("look_fail"))
+        else:
+            folder = _os.path.join(_os.path.expanduser("~"), "Pictures", "Capri")
+            _os.makedirs(folder, exist_ok=True)
+            path = _os.path.join(folder, f"look_{int(_time.time())}.png")
+            _IG.grab(all_screens=True).save(path)
+        try:
+            log.info("DESCPIC attempt")
+            from vision import describe_image
+            what = describe_image(path, kind=low_kind, local_ai_fallback=ai)
+        except Exception:
+            log.exception("Не смогла посмотреть (%s)", kind)
+            return Reply(line("look_fail"))
+        if not what or what.startswith(("No vision provider", "Failed to describe", "Локальная vision-модель")):
+            return Reply(what)
+        if not what:
+            return Reply(line("look_fail"))
+        detail = {"what": what, "_source_path": path}
+        if self.commentator and ai:
+            try:
+                return Reply(self.commentator.render(low_kind if low_kind in {"wallpaper", "screen"} else "screen", detail, (ai.quip if ai else None), line))
+            except Exception:
+                pass
+        prompt = f"Пользователь просит воспринять картинку. Vision-описание: {what}. Ответь от лица Капри кратко и с характером."
+        if self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            answer = self.ai.ask(prompt)
+        elif self.cfg.get("local_ai") and self.local:
+            answer = self.local.ask(prompt)
+        else:
+            answer = what
+        return Reply(answer if answer else what)
+
+    def _outcome_cmd(self, kind):
+        """«я слил» / «ура, прошёл»: стёб, подбадривание или похвала — по тому, что заходит. Если подколки выключены,
+        фраза идёт дальше, как обычный разговор."""
+        if not self.cfg.get("commentary", True):
+            return None
+        key = self.games.current()
+        g = self.games.get(key) if key else None
+        detail = {"t": g["name"] if g else ""}
+        quip = self.local.quip if self.local else None
+        if self.commentator:
+            found = self.commentator.outcome(kind, detail, explicit=True)  # сама позвала — отвечаем всегда
+            if found:
+                return Reply(self.commentator.render(found[0], found[1], quip, line))
+            return None
+        return Reply(commentary.compose(kind, detail, quip, line, rude=bool(self.cfg.get("profanity"))))
+
+    def loss_cmd(self, c, m):
+        return self._outcome_cmd("loss")
+
+    def win_cmd(self, c, m):
+        return self._outcome_cmd("win")
+
+    def _feedback(self, positive):
+        """Твоя реакция на только что сказанную реплику Капри. Без реплики это обычный разговор, и фраза идёт дальше."""
+        learn = self.commentator.learn if self.commentator else None
+        if not learn or not learn.feedback(positive):
+            return None
+        return Reply(line("feedback_like" if positive else "feedback_dislike"))
+
+    def feedback_like(self, c, m):
+        return self._feedback(True)
+
+    def feedback_dislike(self, c, m):
+        return self._feedback(False)
+
+    # --- игры пользователя (учёт и память — в games.py) ---
+    def _learn_about(self, key):
+        """Фоном узнаёт об игре из Википедии, чтобы потом рассказать о ней. Чужую статью не берём."""
+        g = self.games.get(key)
+        if not g or g.get("about"):
+            return
+        text = wiki_summary(g["name"] + " игра", 2)
+        if text and games.about_matches(g["name"], text):
+            self.games.set_about(key, text)
+
+    def on_game_event(self, kind, key, minutes):
+        """Событие трекера → что сказать вслух (или None). Говорим только когда игру закрыли."""
+        g = self.games.get(key)
+        if not g:
+            return None
+        if kind == "new":
+            self.game_announce.add(key)
+            threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+            return None
+        if kind != "end":
+            return None
+        first = key in self.game_announce
+        self.game_announce.discard(key)
+        now = time.time()
+        if first:
+            text = line("game_new", t=g["name"], d=games.fmt_minutes(max(minutes, 1)))
+        elif minutes >= 30 and now - self.game_spoke_at > 3 * 3600:
+            text = line("game_end", t=g["name"], d=games.fmt_minutes(minutes))
+        else:
+            return None
+        self.game_spoke_at = now
+        return text
+
+    def game_teach(self, c, m):
+        """«запомни эту игру как терария» — игра, окно которой сейчас на экране."""
+        name = re.sub(r"^(как|под названием|под именем|с названием|назови)\s+", "", (m.group("name") or "").strip())
+        name = name.strip(" «»\"")
+        if not name:
+            return Reply(line("game_noname"))
+        exe = automation.window_exe(ctypes.windll.user32.GetForegroundWindow())
+        base = os.path.splitext(os.path.basename(exe or ""))[0].lower()
+        if not exe or base in PROTECTED_PROCS or base in games.GENERIC_HOSTS:
+            return Reply(line("game_no_window"))
+        key, _ = self.games.teach(name, exe)
+        threading.Thread(target=self._learn_about, args=(key,), daemon=True).start()
+        return Reply(line("game_taught", t=name))
+
+    def game_forget(self, c, m):
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        if key is None:
+            return None  # не игра из списка — пусть решает обычное «забудь программу»
+        return Reply(line("game_forgot", t=self.games.forget(name)))
+
+    def game_note(self, c, m):
+        """«запиши про игру: на третьем боссе нужен лук» — заметка к игре, которая запущена или была последней."""
+        key = self.games.current()
+        if key is None:
+            return Reply(line("game_note_none"))
+        note = m.group("note").strip()
+        self.games.add_note(key, note)
+        return Reply(line("game_note", t=self.games.get(key)["name"], n=note[:80]))
+
+    def game_list(self, c, m):
+        top = self.games.top(3)
+        if not top:
+            return Reply(line("game_none"))
+        parts = [line("game_top", t=top[0][1]["name"], d=games.fmt_minutes(top[0][1]["minutes"]))]
+        if len(top) > 1:
+            parts.append(line("game_others", t=", ".join(f"«{g['name']}»" for _, g in top[1:])))
+        if self.games.running():
+            parts.append(line("game_running", t=", ".join(f"«{n}»" for n in self.games.running())))
+        return Reply(" ".join(parts))
+
+    def game_time(self, c, m):
+        key = self.games.find(m.group("name"))
+        if key is None:
+            return None  # «сколько я играл сегодня» — не про игру из списка
+        g = self.games.get(key)
+        text = line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"])
+        if g["last_played"] and key not in self.games.active:
+            text += " " + line("game_last", w=games.ago(g["last_played"]))
+        return Reply(text)
+
+    def game_info(self, c, m):
+        """«расскажи про игру террария» — что Капри о ней узнала и что ты сам записал."""
+        name = m.group("name").strip()
+        key = self.games.find(name)
+        g = self.games.get(key) if key else None
+        about = g.get("about") if g else None
+        if not about:
+            about = wiki_summary(name + " игра", 2)
+            if not (about and games.about_matches(name, about)):
+                about = None
+            elif key:
+                self.games.set_about(key, about)
+        if not about and not g:
+            return None  # ничего не знаю — пусть ответит нейросеть
+        parts = [about] if about else []
+        if g:
+            parts.append(line("game_time", t=g["name"], d=games.fmt_minutes(g["minutes"]), n=g["sessions"]))
+            if g["notes"]:
+                parts.append("Твоя заметка: " + g["notes"][-1]["text"] + ".")
+        return Reply(line("game_info", t=" ".join(parts)))
+
+    def game_launch(self, c, m):
+        """«запусти террарию» — только для игр из списка и только если это не свой сайт или программа."""
+        name = m.group("name").strip()
+        n = norm(name)
+        if n in self.sites or n in self.apps or n in self.aliases:
+            return None
+        key = self.games.find(name, min_score=0.8)
+        if key is None:
+            return None
+        g = self.games.get(key)
+        if key in self.games.active:
+            return Reply(line("game_already", t=g["name"]))
+        if not os.path.isfile(g["exe"]):
+            return Reply(line("game_launch_fail", t=g["name"]))
+        subprocess.Popen([g["exe"]], cwd=os.path.dirname(g["exe"]))
+        return Reply(line("game_launch", t=g["name"]))
+
+    def describe_picture(self, c, m):
+        log.info("DESCPIC BEGIN c=%r", c)
+        import base64 as _b64, os as _os, re as _re, time as _time
+        from PIL import ImageGrab as _ImageGrab
+        low = c.lower()
+        path = (m.groupdict().get("path") or "").strip().strip('"').strip()
+        if not path and _os.path.exists(c):
+            cand = _re.findall(r"[A-Za-z]:\\\\[^\\s\"']+", c)
+            if cand:
+                path = cand[-1]
+        screenish = any(w in low for w in ("экран", "screen", "обои", "wallpaper"))
+        use_screenshot = False
+        if (not path) or screenish:
+            folder = _os.path.join(_os.path.expanduser("~"), "Pictures", "Capri")
+            _os.makedirs(folder, exist_ok=True)
+            path = _os.path.join(folder, f"look_{int(_time.time())}.png")
+            _ImageGrab.grab(all_screens=True).save(path)
+            use_screenshot = True
+        if not _os.path.exists(path):
+            return Reply("Не нашла этот файл. Укажи полный путь к картинке или напиши «опиши экран».")
+        if self.cfg.get("vision_engine") == "ollama-local":
+            try:
+                if self.local is None:
+                    from local_ai import LocalAI
+                    self.local = LocalAI(self.cfg)
+                try:
+                    self.local.start_server()
+                except Exception:
+                    pass
+                ai = self.local
+            except Exception:
+                ai = None
+        elif self.cfg.get("local_ai") and self.local:
+            ai = self.local
+        elif self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            ai = self.ai
+        else:
+            ai = None
+        try:
+            desc = vision.describe_image(path, kind=("wallpaper" if "обои" in low else "screen"), local_ai_fallback=ai)
+            log.info("DESCPIC desc=%r", (desc or "")[:80])
+        except Exception as e:
+            import traceback; traceback.print_exc(); return Reply(f"Описание картинки не получилось: {e}")
+        txt = desc if desc else "Не удалось рассмотреть картинку."
+        detail = {"what": txt, "_source_path": path}
+        if self.commentator and ai and not (txt.startswith("No vision provider") or txt.startswith("Failed to describe") or txt.startswith("Локальная vision-модель")):
+            try:
+                return Reply(self.commentator.render(kind if kind in {"wallpaper", "screen"} else "screen", detail, ai.quip if ai else None, line))
+            except Exception:
+                pass
+        if txt.startswith("No vision provider") or txt.startswith("Failed to describe"):
+            return Reply(txt)
+        prompt = "Пользователь просит воспринять картинку. Vision-описание: " + txt + ". Ответь от лица Капри кратко и с характером."
+        if self.cfg.get("enable_ai") and self.ai and self.ai.available:
+            answer = self.ai.ask(prompt)
+        elif self.cfg.get("local_ai") and self.local:
+            answer = self.local.ask(prompt)
+        else:
+            answer = txt
+        return Reply(answer if answer else txt)
 
     def _run(self, target):
         if target.startswith(("http://", "https://")):

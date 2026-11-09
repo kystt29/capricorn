@@ -13,3 +13,11 @@ samples/
 __pycache__/
 *.pyc
 *.tmp
+
+# учёт игр — личные данные
+games.json
+games.json.tmp
+games.json.bad
+learning.json
+learning.json.tmp
+learning.json.bad

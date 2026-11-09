@@ -452,6 +452,31 @@ def _trim_cache():
         pass
 
 
+def clear_tts_cache(max_age_days=None, max_log_lines=5000):
+    """Удалить старые файлы TTS‑кеша (и при необходимости обрезать capri.log). Возвращает число удалённых файлов."""
+    removed = 0
+    try:
+        os.makedirs(TTS_CACHE, exist_ok=True)
+        cutoff = time.time() - int(max_age_days) * 86400 if max_age_days is not None else None
+        for name in os.listdir(TTS_CACHE):
+            path = os.path.join(TTS_CACHE, name)
+            if cutoff is not None:
+                try:
+                    if os.path.getmtime(path) > cutoff:
+                        continue
+                except OSError:
+                    continue
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    # ротация capri.log — BASE доступен из main? Держим лог в модуле capri, но voice.py не знает BASE.
+    return removed
+
+
 class Speaker:
     def __init__(self, cfg):
         self.voice = cfg.get("voice", "ru-RU-SvetlanaNeural")
@@ -529,13 +554,16 @@ class Speaker:
             except Exception:
                 log.exception("Silero не сработал, говорю голосом Microsoft")
         import edge_tts
+        # уникальные временные файлы на каждый синтез — не конфликтуем с playback/другими потоками
+        base = os.path.join(tempfile.gettempdir(), f"capri_tts_{os.getpid()}_{int(time.time() * 1000)}")
+        self.path = base + ".mp3"
         # по предложениям: они синтезируются параллельно, поэтому длинный ответ ждём как одно предложение
         sentences = [s for s in re.split(r"(?<=[.!?…])\s+", text) if s.strip()] or [text]
         semis = lively_semitones(sentences, self.shift, random.Random(), self.lively)
         # тон поднимаем сами (Microsoft выше ~260 Гц не поднимает), а ускорение от этого
         # заранее гасим, замедляя синтез на столько же
         rates = [f"{round(_pct(self.rate) - (2 ** (k / 12) - 1) * 100):+d}%" for k in semis]
-        parts = [f"{self.path[:-4]}_{i}.mp3" for i in range(len(sentences))]
+        parts = [f"{base}_{i}.mp3" for i in range(len(sentences))]
 
         async def go():  # фразы синтезируются параллельно — задержка как у одной
             await asyncio.gather(*(edge_tts.Communicate(s, self.voice, rate=r, pitch=self.pitch).save(f)
@@ -550,8 +578,8 @@ class Speaker:
             x = np.concatenate(chunks)
             if self.fx > 0:
                 x = fx_process(x, self.fx)
-            write_wav(dst, x, volume=self.volume)
-            return dst
+            write_wav(base + ".wav", x, volume=self.volume)
+            return base + ".wav"
         except Exception:
             log.exception("Обработка голоса не удалась, говорю чистым голосом")
             if len(parts) == 1:
@@ -648,3 +676,20 @@ def play_sound_async(path):
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception:
         pass
+
+
+def edge_voices(locale_prefix=""):
+    """Список голосов Microsoft Edge TTS (ShortName). Если сеть/модуль недоступны — пустой список."""
+    try:
+        import asyncio
+        import edge_tts
+        result = asyncio.run(asyncio.wait_for(edge_tts.list_voices(), timeout=12))
+    except Exception:
+        return []
+    out = []
+    low = (locale_prefix or "").lower()
+    for v in result or []:
+        name = v.get("ShortName")
+        if name and (not low or name.lower().startswith(low)):
+            out.append(name)
+    return sorted(set(out))

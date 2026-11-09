@@ -40,8 +40,16 @@ try:
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
+    import commentary
+    from commentary import TOGGLE_RE, Commentator, heard_laugh, heard_outcome
+    import effects
+    import freestyle
+    from games import GameTracker
+    from learning import Learning
     from local_ai import LocalAI
-    from persona import LINES, gendered, line, set_user
+    import screen as screenmod
+    from screen import ScreenWatcher
+    from persona import CONTEXT_PROVIDERS, LINES, TOPIC_PROVIDERS, gendered, line, set_user
     from avatar import Avatar
     import zapret
     from voice import (Listener, Speaker, default_input_name, google_stt, input_devices, make_glitch_sound,
@@ -54,6 +62,28 @@ except ImportError as e:
 
 DEFAULTS = {
     "enable_ai": False,
+    "scenarios": {},
+    "vision_engine": "modlens", 
+    "vision_source": "gemini",
+    "track_games": True,
+    "animations": True,
+    "commentary": True,
+    "commentary_minutes": 6,
+    "commentary_anytime": False,
+    "commentary_wallpaper": False,
+    "profanity": False,
+    "commentary_titles": True,
+    "react_to_voice": False,
+    "screen_reactions": False,
+    "steam_confirm": True,
+    "steam_path": "",
+    "steam_friends": {},
+    "cache_cleanup_on_start": False,
+    "cache_cleanup_days": 14,
+    "high_quality_anim": True,
+    "ai_provider": "anthropic",
+    "ai_api_key": "",
+    "ai_base_url": "",
     "local_ai": True,
     "local_model": "qwen3:8b",
     "barge_in": True,
@@ -254,6 +284,7 @@ class Capri(QObject):
     roam = Signal()
     hop = Signal()
     move_to = Signal(str)
+    fx = Signal(str)
 
     def __init__(self, cfg):
         super().__init__()
@@ -269,6 +300,19 @@ class Capri(QObject):
         self.config_mtime = self._config_mtime()
         self.zapret_checked = False  # предлагали ли уже исправить zapret в этом сеансе
         self.actions.local = self.local
+        if self.cfg.get("track_games", True):
+            self.game_tracker = GameTracker(self.actions.games, self._on_game_event)
+        else:
+            self.game_tracker = None
+        self.learning = Learning(os.path.join(BASE, "learning.json"))
+        CONTEXT_PROVIDERS.append(self.learning.habits_summary)
+        TOPIC_PROVIDERS.append(self.learning.habit_topics)
+        CONTEXT_PROVIDERS.append(lambda: PROFANITY_CONTEXT if self.cfg.get("profanity") else "")
+        self.commentator = Commentator(self.actions.games, self._on_comment, self._can_comment, self.cfg,
+                                       learn=self.learning, looker=self._look)
+        self.actions.commentator = self.commentator
+        self.screen = ScreenWatcher(self.actions.games, self._on_screen_outcome, self.cfg)
+        self.profanity_toggle_reply = None
         self.speaker = Speaker(cfg)
         self.jobs = queue.Queue()
         self.awake_until = 0.0
@@ -297,6 +341,12 @@ class Capri(QObject):
                                      gain=float(self.cfg.get("mic_gain", 1.0)),
                                      sensitivity=int(self.cfg.get("mic_sensitivity", 100)))
             self.listener.start()
+            if self.cfg.get("cache_cleanup_on_start"):
+                threading.Thread(target=lambda: self.cleanup_cache_and_logs(speak=False), daemon=True).start()
+            if self.game_tracker:
+                self.game_tracker.start()
+            self.commentator.start()
+            self.screen.start()
         else:
             self.jobs.put(("say", line("no_model")))
             return
@@ -339,6 +389,10 @@ class Capri(QObject):
     def chatter_line(self):
         hour = time.localtime().tm_hour
         text = None
+        current = self.actions.games.current()
+        game = self.actions.games.get(current) if current else None
+        if game and "cyberpunk" in (game.get("name") or "").lower() and random.random() < 0.55:
+            return line("game_cyberpunk_play")
         if 0 <= hour < 5 and random.random() < 0.5:
             text = line("chatter_night")
         elif 6 <= hour < 11 and random.random() < 0.3:
@@ -417,6 +471,7 @@ class Capri(QObject):
             return
         woke = self.has_wake(text)
         if not woke and now > self.awake_until:
+            self.overheard(text)
             return
         cmd = self.strip_wake(text) if woke else text
         if STOP_RE.match(cmd.strip()) and len(cmd.split()) <= 3:
@@ -444,6 +499,116 @@ class Capri(QObject):
             save_setting(key, value)
         apply_user(self.cfg)
         log.info("Обращение: %s, %s", user_display_name(self.cfg) or "без имени", gender)
+
+    def clear_ai_history(self):
+        """Очистить историю разговора у активных ИИ (Cloud + локальный)."""
+        try:
+            self.ai.history = []
+        except Exception:
+            pass
+        if self.local:
+            try:
+                self.local.history = []
+            except Exception:
+                pass
+        log.info("История ИИ очищена")
+        self.jobs.put(("say", "История ИИ очищена."))
+
+    def cleanup_cache_and_logs(self, speak=True):
+        """Удалить старые файлы TTS-кеша и обрезать журнал."""
+        removed = 0
+        try:
+            from voice import clear_tts_cache
+            removed = clear_tts_cache(self.cfg.get("cache_cleanup_days", 14))
+        except Exception:
+            log.exception("Очистка кеша не удалась")
+        try:
+            log_path = os.path.join(BASE, "capri.log")
+            if os.path.isfile(log_path):
+                with open(log_path, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                if len(lines) > 5000:
+                    with open(log_path, "w", encoding="utf-8") as f:
+                        f.write("\\n".join(lines[-5000:]) + "\\n")
+        except Exception:
+            log.exception("Обрезка журнала не удалась")
+        if speak:
+            self.jobs.put(("say", f"Очистила кеш: {removed} файлов, журнал обрезан."))
+        log.info("Очистка завершена, удалено: %d", removed)
+
+    def set_commentary(self, on):
+        """Включить/выключить комментарии."""
+        self.cfg["commentary"] = bool(on)
+        save_setting("commentary", bool(on))
+        log.info("Комментарии: %s", "включены" if on else "выключены")
+
+    def set_profanity(self, on):
+        """Включить/выключить мат в подколках."""
+        self.cfg["profanity"] = bool(on)
+        save_setting("profanity", bool(on))
+        log.info("Мат: %s", "включён" if on else "выключен")
+
+    def set_anytime(self, on):
+        """Свободный режим."""
+        self.cfg["commentary_anytime"] = bool(on)
+        save_setting("commentary_anytime", bool(on))
+        if on and not self.cfg.get("commentary", True):
+            self.set_commentary(True)
+        log.info("Свободный режим: %s", "включён" if on else "выключен")
+
+    def set_screen_reactions(self, on):
+        """Реакции по экрану."""
+        self.cfg["screen_reactions"] = bool(on)
+        save_setting("screen_reactions", bool(on))
+        self.screen.broken = False
+        log.info("Реакции по экрану: %s", "включены" if on else "выключены")
+
+    def open_import_config_dialog(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(None, "Импортировать конфиг другой Капри", "",
+                                              "Файл конфига (config.json *.json);;Все файлы (*.*)")
+        if path:
+            msg = self.import_config(path)
+            self.jobs.put(("say", msg))
+
+    def import_config(self, path):
+        """Импортировать сайты, программы, свои ответы и базовые настройки из config другой Капри.
+        Данные сливаем, не затирая встроенные настройки. Возвращает краткий результат."""
+        import os
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except Exception as e:
+            return "Не удалось прочитать этот конфиг: " + str(e)
+        if not isinstance(data, dict):
+            return "Этот файл не похож на config Капри."
+        site_keys = ("sites", "apps", "app_aliases", "replies")
+        merged_keys = []
+
+        def change(existing):
+            for key, value in data.items():
+                if key in site_keys and isinstance(value, dict):
+                    existing.setdefault(key, {})
+                    existing[key].update(value)
+                    merged_keys.append(key)
+                elif key in existing and isinstance(existing[key], dict) and isinstance(value, dict):
+                    existing[key].update(value)
+                    merged_keys.append(key)
+                elif value is not None:
+                    existing[key] = value
+                    merged_keys.append(key)
+            for key in ("user_name_mode", "user_name", "user_gender"):
+                if key in data:
+                    existing[key] = data[key]
+        err = _edit_config(change)
+        if err:
+            return "Импорт не применился: " + err
+        try:
+            self.reload_config_if_changed(speak=False)
+        except Exception:
+            pass
+        keys = ", ".join(sorted(set(merged_keys))) or "базовые настройки"
+        return (f"Конфиг импортирован, слито: {keys}. Капри перечитала список, проверь Настройки.")
 
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
@@ -484,7 +649,10 @@ class Capri(QObject):
             return
         self.config_mtime = mtime
         for key in ("sites", "apps", "app_aliases", "search_when_unsure", "browser", "chatter", "replies",
-                    "user_name_mode", "user_name", "user_gender"):
+                    "scenarios", "user_name_mode", "user_name", "user_gender",
+                    "track_games", "animations", "commentary", "commentary_minutes", "commentary_anytime",
+                    "commentary_wallpaper", "profanity", "commentary_titles", "react_to_voice", "screen_reactions",
+                    "steam_confirm", "steam_path", "steam_friends"):
             self.cfg[key] = fresh[key]
         self.actions.set_lists(self.cfg)
         apply_user(self.cfg)
@@ -561,6 +729,74 @@ class Capri(QObject):
         self.summon.emit()
         self.jobs.put(("text", text))
 
+    def _look(self, kind):
+        """Описание обоев или экрана для наблюдателя (его поток); None, если посмотреть нечем."""
+        if not self.local:
+            return None
+        try:
+            return freestyle.describe(self.local, kind)
+        except freestyle.NoVision:
+            if not getattr(self, "_novision_logged", False):
+                self._novision_logged = True
+                log.info("Обои и экран: в Ollama нет модели с «глазами» (например: ollama pull qwen2.5vl:3b)")
+        except Exception:
+            log.exception("Не удалось посмотреть (%s)", kind)
+        return None
+
+    def _on_screen_outcome(self, kind):
+        """Надпись победы или поражения на экране в игре (поток наблюдателя за экраном)."""
+        key = self.actions.games.current()
+        g = self.actions.games.get(key) if key else None
+        found = self.commentator.outcome(kind, {"t": g["name"] if g else ""})
+        if found:
+            self.jobs.put(("roast",) + found)
+
+    def _on_game_event(self, kind, key, minutes):
+        """Трекер игр (его поток): Капри говорит только когда игра закрылась, поверх игры не лезет.
+        Подколка («слил», марафон) важнее обычного «наиграл N минут»; первое знакомство с игрой — не стебём."""
+        first = key in self.actions.game_announce
+        g = self.actions.games.get(key)
+        is_cyb = bool(g) and "cyberpunk" in (g.get("name") or "").lower()
+        text = self.actions.on_game_event(kind, key, minutes)
+        if is_cyb and kind == "start" and first:
+            self.jobs.put(("say", line("game_cyberpunk_start")))
+        if is_cyb and kind == "end":
+            self.jobs.put(("say", line("game_cyberpunk_end")))
+        found = self.commentator.on_game_event(kind, key, minutes)
+        if found and not first and not is_cyb:
+            self.jobs.put(("roast",) + found)
+        elif text:
+            self.jobs.put(("say", text))
+
+    def _can_comment(self, strict):
+        """Можно ли сейчас вставить реплику: Капри молчит и не занята, а для обычных подколок ещё и ничего
+        на весь экран (игра, фильм) и нет разговора с ней."""
+        if self.speaking or not self.jobs.empty():
+            return False
+        return not strict or (time.time() - self.last_activity > 20 and not fullscreen_app_active())
+
+    def _play_fx(self, name):
+        if name and self.cfg.get("animations", True):
+            self.fx.emit(name)
+
+    def _on_comment(self, situation, detail):
+        """Наблюдатель (его поток): подколку придумает рабочий поток, чтобы не стоять в ожидании нейросети."""
+        self.jobs.put(("roast", situation, detail))
+
+    def overheard(self, text):
+        """Услышала разговор без имени. Только если включено "react_to_voice": «слили!» и «ура!» в игре — стёб или
+        похвала; смех сразу после её реплики — оценка «зашло»."""
+        if not self.cfg.get("react_to_voice") or self.speaking:
+            return
+        kind = heard_outcome(text)
+        if kind:
+            found = self.commentator.overheard(kind)
+            if found:
+                self.jobs.put(("roast",) + found)
+        elif heard_laugh(text):
+            self.learning.feedback(True)
+
+
     # ----- рабочий поток -----
     def _worker(self):
         try:
@@ -578,8 +814,16 @@ class Capri(QObject):
 
     def _process(self, job):
         kind = job[0]
+        if kind == "roast":
+            text = self.commentator.render(job[1], job[2], self.local.quip if self.local else None, line)
+            self.summon.emit()
+            self._play_fx(effects.for_situation(job[1], (job[2] or {}).get("mode")))
+            if text and not self.say(text):
+                self.mode.emit("idle", 0.0)
+            return
         if kind == "chatter":
             text = self.chatter_line()
+            self._play_fx("tada" if random.random() < 0.45 else "sway")
             if random.random() < self.cfg.get("roam_chance", 0.5):
                 self.roam.emit()          # гуляет по экрану, окно с текстом сверху
                 time.sleep(1.5)
@@ -587,6 +831,8 @@ class Capri(QObject):
                 self.summon.emit()
             if not self.say(text):
                 self.mode.emit("idle", 0.0)
+            else:
+                self._play_fx("pop")
             return
         self.last_activity = time.time()
         if kind == "say":
@@ -598,12 +844,16 @@ class Capri(QObject):
                 return
             if not self.say(job[1]):
                 self.mode.emit("idle", 0.0)
+            else:
+                self._play_fx("bounce")
             return
         if kind == "voice":
             _, cmd, audio, woke = job
             self.summon.emit()
             self.mode.emit("thinking", 0.0)
             self.subtitle.emit("> " + cmd)
+            self._play_fx("sway")
+
             if self.cfg.get("use_google_stt"):
                 better = google_stt(audio)
                 if better:
@@ -628,8 +878,17 @@ class Capri(QObject):
         self.reload_config_if_changed()
 
         reply = self.actions.handle(cmd)
+        if reply is not None and reply.action == "import_config":
+            self.open_import_config_dialog()
+            return
         if reply is not None and reply.action in ("mic_info", "mic_next"):
             reply = self.mic_command(reply.action)
+        elif reply is not None and reply.action and reply.action.startswith("commentary:"):
+            self.set_commentary(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("profanity:"):
+            self.set_profanity(reply.action.endswith("on"))
+        elif reply is not None and reply.action and reply.action.startswith("anytime:"):
+            self.set_anytime(reply.action.endswith("on"))
         if reply is None:
             if self.cfg.get("enable_ai") and self.ai.available:
                 reply = Reply(self.ai.ask(cmd), "answer")
@@ -638,8 +897,11 @@ class Capri(QObject):
                 reply = Reply(answer, "answer") if answer else self.actions.fallback(cmd, force_search=bool(self.local))
         if reply.action == "answer" and self.cfg.get("teleport_on_answer"):
             self.hop.emit()  # отвечает, скача по экрану красной молнией
-        if reply.action == "wave":
+        if reply.action and reply.action.startswith("fx:"):
+            self._play_fx(reply.action[3:])
+        elif reply.action == "wave":
             self.anim.emit("capri")
+            self._play_fx("bounce")
         elif reply.action and reply.action.startswith("move:"):
             self.move_to.emit(reply.action[5:])
         elif reply.action == "roam":
@@ -734,6 +996,10 @@ def main():
     cfg = load_config()
 
     avatar = Avatar(os.path.join(BASE, "assets"))
+    avatar.high_quality_anim = bool(cfg.get("high_quality_anim", True))
+    if not avatar.high_quality_anim:
+        avatar._crt_line = lambda *a, **k: None
+        avatar.fx.play = lambda *a, **k: None
     avatar.hide_after = float(cfg["hide_after_seconds"])
     apply_user(cfg)
     capri = Capri(cfg)
@@ -743,6 +1009,7 @@ def main():
     capri.subtitle.connect(avatar.set_subtitle)
     capri.quit_app.connect(app.quit)
     capri.anim.connect(avatar.play_anim)
+    capri.fx.connect(avatar.play_effect)
     capri.roam.connect(avatar.start_roam)
     capri.hop.connect(avatar.start_hopping)
     capri.move_to.connect(avatar.move_to_named)
@@ -777,13 +1044,34 @@ def main():
         from profile_dialog import ProfileDialog
         show_window("profile", lambda: ProfileDialog(capri))
 
+    def open_settings():
+        from settings_dialog import SettingsDialog
+        capri.reload_config_if_changed(speak=False)
+        show_window("settings", lambda: SettingsDialog(capri))
+
+    def open_import_config():
+        from PySide6.QtWidgets import QFileDialog
+        import os
+        path, _ = QFileDialog.getOpenFileName(None, "Импортировать конфиг другой Капри", "",
+                                              "config.json (config.json *.json);;Все файлы (*.*)")
+        if not path:
+            return
+        msg = capri.import_config(path)
+        capri.jobs.put(("say", msg))
+        log.info("Импорт конфига: %s — %s", path, msg)
+
     menu = QMenu()
     for title, fn in (("Позвать Капри", capri.call_from_click),
                       ("Замолчать", capri.interrupt),
                       ("Написать команду…", ask_text),
                       ("Мои сайты, программы и ответы…", open_entries),
+                      ("Очистить историю ИИ", lambda: capri.clear_ai_history()),
+                       ("Настройки…", open_settings),
+                       ("Импортировать конфиг из другой Капри…", open_import_config),
                       ("Как ко мне обращаться…", open_profile),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
+("Настройки микрофона Windows", lambda: os.startfile("ms-settings:privacy-microphone")),
+("Очистить кэш и логи", lambda: capri.cleanup_cache_and_logs()),
                       ("Спрятать", avatar.vanish),
                       ("MIC", None),
                       ("SEARCH", None),
@@ -857,9 +1145,33 @@ def main():
             chatter_act.toggled.connect(capri.set_chatter)
             menu.addAction(chatter_act)
 
-            def sync_search(a=search_act, b=chatter_act):
+            # комментарии и стиль (PR #11)
+            commentary_act = QAction("Комментировать действия", menu)
+            commentary_act.setCheckable(True)
+            commentary_act.toggled.connect(capri.set_commentary)
+            menu.addAction(commentary_act)
+
+            profanity_act = QAction("Ругаться (мат в подколках)", menu)
+            profanity_act.setCheckable(True)
+            profanity_act.toggled.connect(capri.set_profanity)
+            menu.addAction(profanity_act)
+
+            anytime_act = QAction("Комментировать всё (свободный режим)", menu)
+            anytime_act.setCheckable(True)
+            anytime_act.toggled.connect(capri.set_anytime)
+            menu.addAction(anytime_act)
+
+            screen_act = QAction("Реагировать на экран в играх (эксперимент)", menu)
+            screen_act.setCheckable(True)
+            screen_act.toggled.connect(capri.set_screen_reactions)
+            menu.addAction(screen_act)
+
+            def sync_search(a=search_act, b=chatter_act, c=commentary_act, d=profanity_act,
+                            e=anytime_act, f=screen_act):
                 capri.reload_config_if_changed(speak=False)  # могли поменять в config.json руками
-                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True)):
+                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True),
+                                          (c, "commentary", True), (d, "profanity", False),
+                                          (e, "commentary_anytime", False), (f, "screen_reactions", False)):
                     act.blockSignals(True)
                     act.setChecked(bool(capri.cfg.get(key, default)))
                     act.blockSignals(False)
