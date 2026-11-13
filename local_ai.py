@@ -123,6 +123,24 @@ def strip_reasoning(text):
     return re.sub(r"<think>.*", "", text, flags=re.S).strip()
 
 
+# Ollama не запущена / упала / модели нет — это лечится перезапуском Ollama; таймаут — нет
+RECOVERABLE = re.compile(r"10061|10054|refused|отверг|разорвал|reset|404|not found|closed|eof", re.IGNORECASE)
+
+
+def describe_error(e):
+    """Понятная причина, почему нейросеть не ответила."""
+    s = str(e).lower()
+    if re.search(r"404|400|not found|bad request", s):
+        return "в Ollama нет нужной модели. Запусти setup_ai.bat."
+    if re.search(r"10061|refused|отверг", s):
+        return "Ollama не запущена и не запускается. Открой её из меню «Пуск» или переустанови через setup_ai.bat."
+    if re.search(r"timed? ?out|время ожидания", s):
+        return "она слишком долго думала — компьютеру тяжело. Выбери модель полегче в setup_ai.bat."
+    if re.search(r"500|memory|памят", s):
+        return "Ollama не хватило памяти. Закрой лишние программы или выбери модель полегче в setup_ai.bat."
+    return f"{e}"
+
+
 def _post(path, payload, timeout):
     req = urllib.request.Request(URL + path, data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
@@ -153,8 +171,13 @@ def pick_model(names):
 class LocalAI:
     def __init__(self, cfg):
         self.model = cfg.get("local_model", "qwen3:8b")
+        # сколько текста модель держит в памяти. Капри помнит лишь последние реплики, ей хватает 4096; без этого
+        # Ollama берёт размер из своих настроек — на максимуме это десятки ГБ памяти, и она падает
+        self.num_ctx = int(cfg.get("ai_context", 4096))
         self.history = []
         self.on_model_change = None  # main записывает новую модель в config.json
+        self.problem = None          # почему нейросеть не ответила в последний раз — Капри скажет это вслух
+        self.last_restart = 0.0
 
     @staticmethod
     def installed():
@@ -198,10 +221,25 @@ class LocalAI:
             if self.on_model_change:
                 self.on_model_change(other)
         try:
-            _post("/api/generate", {"model": self.model, "prompt": "", "keep_alive": "10m"}, 120)
+            # тот же размер контекста, что и в разговоре — иначе Ollama загрузит модель дважды
+            _post("/api/generate", {"model": self.model, "prompt": "", "keep_alive": "10m",
+                                    "options": {"num_ctx": self.num_ctx}}, 120)
             log.info("Локальная модель %s загружена", self.model)
         except Exception as e:
             log.info("Не удалось прогреть модель: %s", e)
+
+    def _chat_recovering(self, messages):
+        """Ответ модели; если Ollama упала, закрылась или потеряла модель — поднимаем её заново и пробуем ещё раз.
+        Раньше Ollama запускалась только при старте Капри, и после её падения разговор не работал до перезапуска."""
+        try:
+            return self._chat(messages)
+        except Exception as e:
+            if not RECOVERABLE.search(str(e)) or time.time() - self.last_restart < 60:
+                raise
+            self.last_restart = time.time()
+            log.info("Ollama не ответила (%s) — запускаю её заново", e)
+            self.start_server()
+            return self._chat(messages)
 
     def _chat(self, messages, max_tokens=300):
         resp = _post("/api/chat", {
@@ -210,7 +248,8 @@ class LocalAI:
             "stream": False,
             "think": False,  # Qwen3 по умолчанию «рассуждает» вслух — для голоса это лишняя задержка
             "keep_alive": "10m",
-            "options": {"num_predict": max_tokens, "temperature": 0.6, "repeat_penalty": 1.15},
+            "options": {"num_predict": max_tokens, "temperature": 0.6, "repeat_penalty": 1.15,
+                        "num_ctx": self.num_ctx},
         }, 120)
         text = strip_reasoning(resp.get("message", {}).get("content", ""))
         if REASONING.search(text):
@@ -230,13 +269,15 @@ class LocalAI:
         self.history = self.history[-6:]
         messages = [{"role": "system", "content": SYSTEM + "\n" + user_context() + f"\nСейчас {now}."}] + self.history
         try:
-            answer = self._chat(messages)
+            answer = self._chat_recovering(messages)
             if FOREIGN.search(answer):  # Qwen иногда срывается на китайский — пробуем ещё раз
                 answer = self._chat(messages + [{"role": "system", "content":
                                     "Ответь заново, строго только русскими буквами, без иероглифов."}])
             answer = re.sub(r"\s+", " ", FOREIGN.sub("", answer)).strip()
+            self.problem = None
         except Exception as e:
             log.info("Локальная модель недоступна: %s", e)
+            self.problem = describe_error(e)
             self.history.pop()
             return None
         recent = [m["content"] for m in self.history if m["role"] == "assistant"]

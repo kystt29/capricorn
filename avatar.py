@@ -6,8 +6,8 @@ import random
 import time
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal, QPoint
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage, QRegion, QPainter, QPainterPath, QPen,
-                           QPolygonF, QGuiApplication)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage, QImageReader, QRegion, QPainter, QPainterPath,
+                           QPen, QPolygonF, QGuiApplication)
 from PySide6.QtWidgets import QWidget
 
 PINK = QColor(255, 34, 96)
@@ -382,38 +382,51 @@ class LightningOverlay(QWidget):
         p.end()
 
 
-def load_anims(anim_dir):
-    """assets/anim/<имя>/*.png → {имя: [кадры размером W×FIG_H]}. Кадры делает tools/convert_anim.py."""
-    anims = {}
-    if not os.path.isdir(anim_dir):
-        return anims
-    for name in sorted(os.listdir(anim_dir)):
-        folder = os.path.join(anim_dir, name)
-        files = sorted(f for f in os.listdir(folder) if f.lower().endswith(".png")) if os.path.isdir(folder) else []
-        frames = []
-        for f in files:
-            src = QImage(os.path.join(folder, f))
+MAX_FRAMES = 300
+
+
+def fit_frame(src, scale=1.0):
+    """Кадр анимации в окно W×FIG_H: большой уменьшаем по размеру окна, маленький не растягиваем.
+    Персонажа ставим на «пол», остальное (глаз) — по центру."""
+    k = min(1.0, W / src.width(), FIG_H / src.height()) * scale
+    k = min(k, W / src.width(), FIG_H / src.height())
+    sw, sh = max(1, round(src.width() * k)), max(1, round(src.height() * k))
+    src = src.scaled(round(sw * DPR), round(sh * DPR), Qt.AspectRatioMode.IgnoreAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
+    src.setDevicePixelRatio(DPR)
+    img = canvas(W, FIG_H)
+    p = QPainter(img)
+    y = FIG_H - sh if sh >= FIG_H * 0.9 else (FIG_H - sh) // 2
+    p.drawImage(QPointF((W - sw) // 2, y), src)
+    p.end()
+    return img
+
+
+def load_frames(files, scale=1.0):
+    """Кадры из PNG по порядку или из одной GIF. → (кадры, fps из GIF или None)."""
+    frames, delays = [], []
+    for f in files:
+        reader = QImageReader(f)
+        while len(frames) < MAX_FRAMES:
+            src = reader.read()
             if src.isNull():
-                continue
-            src = hidpi(src)
-            img = canvas(W, FIG_H)
-            p = QPainter(img)
-            sw, sh = src.deviceIndependentSize().width(), src.deviceIndependentSize().height()
-            # персонажа ставим на «пол», остальное (глаз) — по центру
-            y = FIG_H - sh if sh >= FIG_H * 0.9 else (FIG_H - sh) // 2
-            p.drawImage(QPointF((W - sw) // 2, y), src)
-            p.end()
-            frames.append(img)
-        if frames:
-            anims[name] = frames
-    return anims
+                break
+            frames.append(fit_frame(src.convertToFormat(FMT), scale))
+            if reader.supportsAnimation():
+                delays.append(reader.nextImageDelay() or 100)
+            if not reader.supportsAnimation() or reader.imageCount() == 1:
+                break
+    fps = None
+    if delays:
+        fps = max(1.0, min(60.0, 1000 / (sum(delays) / len(delays))))
+    return frames, fps
 
 
 class Avatar(QWidget):
     clicked = Signal()
     menu_requested = Signal(QPoint)
 
-    def __init__(self, assets_dir):
+    def __init__(self, skin):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
                          | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -421,34 +434,8 @@ class Avatar(QWidget):
         self.setFixedSize(W, H)
         global DPR
         DPR = max([s.devicePixelRatio() for s in QGuiApplication.screens()] or [1.0])
-
-        # Позы: все картинки из assets/poses (и, для совместимости, assets/capri.png).
-        # Они периодически сменяют друг друга, чтобы Капри не стояла статичной картинкой.
-        pose_dir = os.path.join(assets_dir, "poses")
-        pose_files = []
-        for folder in (assets_dir, pose_dir):
-            if not os.path.isdir(folder):
-                continue
-            for name in sorted(os.listdir(folder)):
-                low = name.lower()
-                if folder == assets_dir and low not in ("capri.png", "capri.jpg", "capri.webp"):
-                    continue
-                if low.endswith((".png", ".webp", ".jpg")) and low not in [os.path.basename(f).lower()
-                                                                            for f in pose_files]:
-                    pose_files.append(os.path.join(folder, name))
-        self.poses = [img for img in (load_custom(f, W, FIG_H) for f in pose_files) if img is not None]
-        if self.poses:
-            self.base, self.eye_pos = self.poses[0], None
-        else:  # картинок нет — рисованная Капри с глазом
-            self.base, self.eye_pos = build_procedural(W, FIG_H)
-            self.poses = [self.base]
-
-        # поза для прогулок: capri_roam.png в assets или в poses
-        self.roam_img = None
-        for path in (os.path.join(assets_dir, "capri_roam.png"), os.path.join(pose_dir, "capri_roam.png")):
-            if os.path.exists(path):
-                self.roam_img = load_custom(path, W, FIG_H)
-                break
+        self.anim = None             # имя проигрываемой анимации
+        self.apply_skin(skin)
         self.pose_idx = 0
         self.next_pose = 0.0
         self.roaming = False
@@ -465,8 +452,6 @@ class Avatar(QWidget):
         self.next_hop = 0.0
         self.on_teleport = None      # звук телепорта (ставит main)
 
-        self.anims = load_anims(os.path.join(assets_dir, "anim"))
-        self.anim = None             # имя проигрываемой анимации
         self.anim_start = 0.0
         self.anim_loop = False
 
@@ -490,6 +475,32 @@ class Avatar(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
+
+    # ---------- скин ----------
+    def apply_skin(self, skin):
+        """Позы и анимации из скина (skins.Skin). Можно менять на ходу из настроек."""
+        # позы периодически сменяют друг друга, чтобы Капри не стояла статичной картинкой
+        self.poses = [img for img in (load_custom(f, W, FIG_H) for f in skin.poses) if img is not None]
+        if self.poses:
+            self.base, self.eye_pos = self.poses[0], None
+        else:  # картинок нет — рисованная Капри с глазом
+            self.base, self.eye_pos = build_procedural(W, FIG_H)
+            self.poses = [self.base]
+        self.pose_idx = 0
+        self.roam_img = load_custom(skin.roam, W, FIG_H) if skin.roam else None
+        cache = {}  # одни и те же кадры на несколько событий (стандартная Капри машет и при запуске)
+        self.anims = {}
+        for event, a in skin.anims.items():
+            key = tuple(a["files"])
+            if key not in cache:
+                cache[key] = load_frames(a["files"], skin.scale)
+            frames, gif_fps = cache[key]
+            if frames:
+                self.anims[event] = (frames, gif_fps or a["fps"], a["loop"])
+        if self.roam_img is None and "roam" in self.anims:
+            self.roam_img = self.anims["roam"][0][0]
+        self.anim = None
+        self.skin = skin
 
     # ---------- управление ----------
     def start_roam(self):
@@ -634,14 +645,18 @@ class Avatar(QWidget):
         if self.state in ("visible", "appearing"):
             self.state, self.k = "vanishing", 0
 
-    def play_anim(self, name, loop=False):
+    def play_anim(self, name, loop=None):
+        """Анимация события скина (intro, wave, thinking…); loop=None — как задано для события."""
+        name = {"capri": "wave", "eyes": "thinking"}.get(name, name)  # старые имена
         if name in self.anims:
-            self.anim, self.anim_start, self.anim_loop = name, time.time(), loop
+            self.anim, self.anim_start = name, time.time()
+            self.anim_loop = self.anims[name][2] if loop is None else loop
 
     def set_mode(self, mode, seconds=0.0):
-        if mode == "thinking" and self.mode != "thinking":
-            self.play_anim("eyes", loop=True)
-        elif mode != "thinking" and self.anim == "eyes":
+        # у состояний (слушает, думает, говорит) может быть своя анимация в скине — играет, пока длится
+        if mode != self.mode and mode in self.anims and mode in ("listening", "thinking", "speaking"):
+            self.play_anim(mode, loop=True)
+        elif self.anim in ("listening", "thinking", "speaking") and self.anim != mode:
             self.anim = None
         if mode != "speaking":
             self.hopping = False
@@ -699,12 +714,16 @@ class Avatar(QWidget):
         self.update()
 
     def _figure(self):
-        if self.anim:
-            frames = self.anims[self.anim]
-            idx = int((time.time() - self.anim_start) * ANIM_FPS)
+        if self.anim in self.anims:
+            frames, fps, _ = self.anims[self.anim]
+            idx = int((time.time() - self.anim_start) * fps)
             if idx < len(frames) or self.anim_loop:
                 return frames[idx % len(frames)].copy()
-            self.anim = None
+        self.anim = None
+        loop = "roam" if self.roaming else "idle"  # ходьба и ожидание — по кругу, если они есть в скине
+        if loop in self.anims:
+            frames, fps, _ = self.anims[loop]
+            return frames[int(time.time() * fps) % len(frames)].copy()
         if self.roaming and self.roam_img is not None:
             return self.roam_img.copy()
         fig = self.base.copy()

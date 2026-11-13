@@ -600,11 +600,15 @@ def youtube_first(query):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept-Language": "ru-RU,ru;q=0.9"})
-    try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            page = r.read().decode("utf-8", "replace")
-    except Exception as e:
-        log.info("Поиск на YouTube не удался: %s", e)
+    page = None
+    for timeout in (6, 10):  # у кого YouTube медленный — вторая попытка подольше
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                page = r.read().decode("utf-8", "replace")
+            break
+        except Exception as e:
+            log.info("Поиск на YouTube не удался: %s", e)
+    if page is None:
         return None
     m = re.search(r'"videoRenderer":\{"videoId":"([\w-]{11})"', page)
     if not m:
@@ -932,6 +936,14 @@ UPDATES_RE = (r"^(есть |проверь |проверить |какие |ко
 REPLY_RE = (r"^((когда|если) (я )?(говорю|скажу|произнесу|спрошу)|на (фразу|слова|вопрос))\s+(?P<p>.+?)\s*,?\s+"
             r"(ты )?(отвечай|ответь|говори|скажи)( мне)?\s+(?P<r>.+)$")
 FORGET_REPLY_RE = r"^(забудь|удали|убери) (свой |мой |этот )?ответ (на|для) (фразу |слова |вопрос )?(?P<p>.+)$"
+# окно настроек Капри: «открой настройки», «где твои настройки», «как сменить скин», «хочу поменять голос»
+# («настройки звука», «настройки windows» — это уже настройки Windows, их открывают программы)
+SETTINGS_RE = (r"^((открой|покажи|запусти|включи|где|как (открыть|найти|попасть в))( мне)? )?(свои |твои |твой |"
+               r"свой |все )?(настройки|настройк\w*|меню настроек|опции)( капри)?( где)?$|"
+               r"как (мне )?(тебя|тебе) (настроить|поменять|изменить)|настрой (себя|себе)|"
+               r"(как|где|хочу|можно)( мне)?( бы)? (поменять|сменить|изменить|настроить|выбрать|добавить)( тебе| твой| твою|"
+               r" твои| свой| свою| свои)? (скин\w*|внешност\w*|облик|вид|аватар\w*|анимаци\w*|голос|громкост\w* голоса|"
+               r"обращени\w*|имя)\b")
 
 
 class Actions:
@@ -957,6 +969,7 @@ class Actions:
             (REMEMBER_RE, self.remember_cmd),
             (FORGET_RE, self.forget_cmd),
             (UPDATES_RE, self.updates),
+            (SETTINGS_RE, self.settings),
             (REPLY_RE, self.reply_cmd),
             (FORGET_REPLY_RE, self.forget_reply_cmd),
             (r"помаши|помахай|махни|помаши ручкой|поздоровайся", self.wave),
@@ -1249,6 +1262,13 @@ class Actions:
     # --- команды ---
     def quit(self, c, m):
         return Reply(line("quit"), "quit")
+
+    def settings(self, c, m):
+        """Окно настроек Капри — сразу на нужной вкладке, если понятно, что хотят поменять."""
+        tab = ("look" if re.search(r"скин|внешн|облик|вид\b|аватар|анимац", c) else
+               "sound" if re.search(r"голос|громк|звук|микрофон", c) else
+               "profile" if re.search(r"обращен|имя", c) else "general")
+        return Reply(line("settings_open"), "settings:" + tab)
 
     def hide(self, c, m):
         return Reply(line("hide"), "hide")
@@ -1619,6 +1639,11 @@ class Actions:
         path = os.path.join(folder, f"report_{datetime.datetime.now():%Y%m%d_%H%M%S}.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(report)
+        for old in sorted(os.listdir(folder))[:-10]:  # храним последние 10 отчётов
+            try:
+                os.remove(os.path.join(folder, old))
+            except OSError:
+                pass
         os.startfile(path)
         use_ai = self.cfg.get("enable_ai") and self.ai and self.ai.available
         spoken = self.ai.summarize_report(report) if use_ai else None
@@ -1693,6 +1718,8 @@ class Actions:
             ords = ["первое", "второе", "третье"]
             listed = ", ".join(f"{ords[i]} — {nm}" for i, nm in enumerate(names))
             return Reply(line("choose_app", t=listed), "ask")
+        if not self.cfg.get("search_when_unsure", True):  # поиск выключен в трее — не открываем Google сами
+            return Reply(line("site_missing", t=t))
         self.web("https://www.google.com/search?q=" + urllib.parse.quote(t))
         return Reply(line("site_unknown", t=t))
 
@@ -1867,6 +1894,8 @@ class Actions:
 
     def info(self, c, m):
         """Открывает поиск Google и вслух пересказывает начало статьи из Википедии, если она нашлась."""
+        if c.startswith("расскажи") and not re.search(r"в интернете|в гугле|в сети", c) and self.local:
+            return None  # «расскажи что-нибудь интересное / про космос» — это болтовня, отвечает нейросеть
         q = m.group("q").strip()
         self.web("https://www.google.com/search?q=" + urllib.parse.quote(q))
         summary = wiki_summary(q)
@@ -1883,9 +1912,13 @@ class Actions:
         kind = m.groupdict().get("kind") or ""
         search = q + (" песня" if re.match(r"песн|трек", kind) else "")
         found = youtube_first(search)
-        if not found:  # не вышло достать первое видео — хотя бы откроем поиск
-            self.web("https://www.youtube.com/results?search_query=" + urllib.parse.quote(search))
-            return Reply(line("yt", q=q))
+        if not found:
+            # Капри сама до YouTube не достучалась (у многих он открывается только в браузере — через VPN-расширение
+            # или zapret). Тогда ссылка DuckDuckGo «сразу к первому результату»: её откроет браузер своим путём
+            # и попадёт прямо на видео, а не на страницу поиска
+            self.web("https://duckduckgo.com/?q=" + urllib.parse.quote("! site:youtube.com/watch " + search))
+            threading.Thread(target=ensure_playing, daemon=True).start()
+            return Reply(line("video_untitled"))
         vid, title = found
         self.web(f"https://www.youtube.com/watch?v={vid}")
         threading.Thread(target=ensure_playing, daemon=True).start()

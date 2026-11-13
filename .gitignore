@@ -6,6 +6,7 @@ models/
 
 # журнал, отчёты диагностики, образцы голоса — личные данные
 capri.log
+capri.log.*
 reports/
 samples/
 

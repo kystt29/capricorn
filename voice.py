@@ -246,6 +246,30 @@ def google_stt(audio, language="ru-RU"):
         return None
 
 
+_LAT = dict(zip("абвгдезийклмнопрстуфхцы", "abvgdeziyklmnoprstufhcy"))
+_LAT.update({"ё": "e", "ж": "zh", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ь": "", "э": "e", "ю": "yu", "я": "ya"})
+
+
+def _skeleton(word):
+    """Согласные слова латиницей: «мама» и «momo» → «mm». Так видно, что это одно и то же слово."""
+    s = re.sub(r"[aeiouy]", "", "".join(_LAT.get(c, c) for c in word.lower()))
+    return re.sub(r"(.)\1+", r"\1", s)
+
+
+def merge_stt(vosk, google):
+    """Google иногда пишет русское слово латиницей («мама» → «momo») — тогда Telegram, сайты и программы
+    ищут не то. Латинское слово Google, которое Vosk услышал по-русски с теми же согласными, меняем обратно."""
+    heard = [w for w in vosk.split() if re.search(r"[а-яё]", w)]
+    out = []
+    for w in google.split():
+        if re.fullmatch(r"[a-z]+", w) and _skeleton(w):
+            same = next((v for v in heard if _skeleton(v) == _skeleton(w)), None)
+            if same:
+                w = same
+        out.append(w)
+    return " ".join(out)
+
+
 # ---------------- синтез речи ----------------
 
 def _mci(cmd):
@@ -443,6 +467,18 @@ CACHE_MAX_TEXT = 160    # фразы длиннее не кэшируем
 CACHE_MAX_FILES = 600   # сколько готовых фраз хранить (~30 МБ)
 
 
+def cleanup_temp():
+    """Временные файлы озвучки от прошлых запусков (capri_tts_<номер процесса>…) — удаляем, иначе копятся."""
+    import glob
+    mine = f"capri_tts_{os.getpid()}"
+    for f in glob.glob(os.path.join(tempfile.gettempdir(), "capri_tts_*")):
+        if not os.path.basename(f).startswith(mine):
+            try:
+                os.remove(f)
+            except OSError:
+                pass  # файл занят другой запущенной Капри — не трогаем
+
+
 def _trim_cache():
     try:
         files = sorted((os.path.join(TTS_CACHE, f) for f in os.listdir(TTS_CACHE)), key=os.path.getmtime)
@@ -466,6 +502,7 @@ class Speaker:
         self.path = os.path.join(tempfile.gettempdir(), f"capri_tts_{os.getpid()}.mp3")
         self.fx_path = os.path.join(tempfile.gettempdir(), f"capri_tts_{os.getpid()}.wav")
         self.stop_event = threading.Event()
+        threading.Thread(target=cleanup_temp, daemon=True).start()
         self.volume = int(cfg.get("voice_volume", 100))  # громкость Капри 0..100, общая громкость Windows не меняется
         self.edge_error = None  # почему не сработал голос Microsoft в последний раз (None — сработал)
         if self.engine == "silero":  # прогреваем модель заранее, чтобы первая фраза не тормозила

@@ -15,8 +15,11 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
 
 # журнал — до всех библиотек: если какой-то не хватает, Капри падает без окна, и узнать причину можно только тут
-logging.basicConfig(filename=os.path.join(BASE, "capri.log"), level=logging.INFO, encoding="utf-8",
-                    format="%(asctime)s %(levelname)s %(message)s")
+# не больше ~1 МБ: старая часть уходит в capri.log.1, ещё более старая удаляется — диск не забивается
+from logging.handlers import RotatingFileHandler  # noqa: E402
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                    handlers=[RotatingFileHandler(os.path.join(BASE, "capri.log"), maxBytes=1_000_000,
+                                                  backupCount=1, encoding="utf-8")])
 log = logging.getLogger("capri")
 log.info("Python %s", sys.version.split()[0])
 
@@ -35,17 +38,17 @@ def fatal(text):
 try:
     from PySide6.QtCore import QObject, Qt, Signal
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPen, QPixmap
-    from PySide6.QtWidgets import (QApplication, QHBoxLayout, QInputDialog, QLabel, QMenu, QSlider,
-                                   QSystemTrayIcon, QWidget, QWidgetAction)
+    from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QSystemTrayIcon
 
     from actions import CAPRI_URL, Actions, Reply
     from ai import AI
     from local_ai import LocalAI
     from persona import LINES, gendered, line, set_user
     from avatar import Avatar
+    import skins
     import zapret
     from voice import (Listener, Speaker, default_input_name, google_stt, input_devices, make_glitch_sound,
-                       play_sound_async)
+                       merge_stt, play_sound_async)
 except ImportError as e:
     log.exception("Не хватает библиотек")
     fatal(f"Не установлены нужные библиотеки ({e.name or e}).\n\n"
@@ -63,7 +66,9 @@ DEFAULTS = {
     "chatter_max_minutes": 40,
     "roam_chance": 0.5,
     "teleport_on_answer": True,
+    "skin": "",              # папка скина в skins/; "" — стандартная Капри (меню в трее → «Настройки…» → «Внешность»)
     "search_when_unsure": True,
+    "ai_context": 4096,      # сколько текста нейросеть держит в памяти; больше — нужно больше памяти
     "voice_volume": 100,     # громкость голоса Капри 0..100 (общая громкость Windows не меняется)
     "mic_gain": 1.0,         # громкость микрофона для Капри: 1 — как есть, 2 — вдвое громче
     "mic_sensitivity": 100,  # 100 — слышит всё; меньше — тихий шум и фон отбрасываются
@@ -105,6 +110,8 @@ DEFAULTS = {
     "apps": {
         "блокнот": "notepad", "калькулятор": "calc", "проводник": "explorer",
         "диспетчер задач": "taskmgr", "параметры": "ms-settings:", "настройки": "ms-settings:",
+        "настройки windows": "ms-settings:", "настройки виндовс": "ms-settings:", "параметры windows": "ms-settings:",
+        "настройки компьютера": "ms-settings:",
         "панель управления": "control", "командную строку": "cmd", "командная строка": "cmd",
         "терминал": "wt", "пейнт": "mspaint", "paint": "mspaint", "ворд": "winword",
         "эксель": "excel", "браузер": "https://www.google.com",
@@ -254,6 +261,7 @@ class Capri(QObject):
     roam = Signal()
     hop = Signal()
     move_to = Signal(str)
+    settings = Signal(str)   # открыть окно настроек на вкладке
 
     def __init__(self, cfg):
         super().__init__()
@@ -268,6 +276,7 @@ class Capri(QObject):
         self.actions = Actions(cfg, BASE, self.ai, save=save_entry)
         self.config_mtime = self._config_mtime()
         self.zapret_checked = False  # предлагали ли уже исправить zapret в этом сеансе
+        self.ai_problem_said = None  # о какой проблеме нейросети уже сказали — не повторяем каждый раз
         self.actions.local = self.local
         self.speaker = Speaker(cfg)
         self.jobs = queue.Queue()
@@ -300,8 +309,8 @@ class Capri(QObject):
         else:
             self.jobs.put(("say", line("no_model")))
             return
-        # вступление: анимация capri + приветствие
-        self.jobs.put(("say", line("greet") if self.cfg.get("greet_on_start") else "", "capri"))
+        # вступление: анимация появления из скина + приветствие
+        self.jobs.put(("say", line("greet") if self.cfg.get("greet_on_start") else "", "intro"))
         if CONFIG_ERROR:
             self.jobs.put(("say", CONFIG_ERROR))
         threading.Thread(target=self._chatter_loop, daemon=True).start()  # сам проверяет, включено ли
@@ -445,6 +454,26 @@ class Capri(QObject):
         apply_user(self.cfg)
         log.info("Обращение: %s, %s", user_display_name(self.cfg) or "без имени", gender)
 
+    def set_autostart(self, on):
+        """Галочка в трее: запускаться вместе с Windows (ярлык в «Автозагрузке»)."""
+        import autostart
+        try:
+            if on:
+                autostart.enable()
+                stray = autostart.stray_run_bat()
+                if stray:  # скопированный туда run.bat не работает — убираем, чтобы не мешал
+                    os.remove(stray)
+            else:
+                autostart.disable()
+            log.info("Автозапуск: %s", "включён" if on else "выключен")
+        except Exception:
+            log.exception("Не удалось изменить автозапуск")
+
+    def set_setting(self, key, value):
+        """Любая настройка из окна «Настройки» — сразу в работу и в config.json."""
+        self.cfg[key] = value
+        save_setting(key, value)
+
     def set_chatter(self, on):
         """Галочка в трее: появляется ли Капри сама (поболтать, погулять по экрану). Сразу и запоминается."""
         self.cfg["chatter"] = bool(on)
@@ -519,6 +548,17 @@ class Capri(QObject):
             save_setting("mic_sensitivity", self.cfg["mic_sensitivity"])
             if self.listener:
                 self.listener.sensitivity = self.cfg["mic_sensitivity"]
+
+    def set_listen_times(self, followup=None, window=None):
+        """Сколько секунд слушать без имени: после ответа (0 — не слушать) и после «Капри» — сразу и запоминаются."""
+        if followup is not None:
+            self.cfg["followup_seconds"] = int(followup)
+            save_setting("followup_seconds", int(followup))
+            if followup <= 0 and not self.speaking:
+                self.awake_until = 0
+        if window is not None:
+            self.cfg["listen_window_seconds"] = int(window)
+            save_setting("listen_window_seconds", int(window))
 
     def set_voice_fx(self, strength):
         """Сила цифровых эффектов голоса: 0 — чистый голос, 1.8 — как задумано, больше — сильнее."""
@@ -607,8 +647,10 @@ class Capri(QObject):
             if self.cfg.get("use_google_stt"):
                 better = google_stt(audio)
                 if better:
-                    better = better.lower()
+                    better = merge_stt(cmd, better.lower())
                     if len(better) >= 2:
+                        if better != cmd:
+                            log.info("Vosk: «%s» → Google: «%s»", cmd, better)
                         cmd = better
         else:
             cmd = job[1]
@@ -636,12 +678,18 @@ class Capri(QObject):
             else:
                 answer = self.local.ask(cmd) if self.local else None
                 reply = Reply(answer, "answer") if answer else self.actions.fallback(cmd, force_search=bool(self.local))
+                problem = self.local.problem if self.local and not answer else None
+                if problem and problem != self.ai_problem_said:  # почему не ответила — говорим один раз
+                    self.ai_problem_said = problem
+                    reply = Reply(line("ai_down", why=problem) + " " + reply.text, reply.action)
         if reply.action == "answer" and self.cfg.get("teleport_on_answer"):
             self.hop.emit()  # отвечает, скача по экрану красной молнией
         if reply.action == "wave":
-            self.anim.emit("capri")
+            self.anim.emit("wave")
         elif reply.action and reply.action.startswith("move:"):
             self.move_to.emit(reply.action[5:])
+        elif reply.action and reply.action.startswith("settings:"):
+            self.settings.emit(reply.action[9:])
         elif reply.action == "roam":
             self.vanish.emit()
             time.sleep(0.8)
@@ -656,8 +704,12 @@ class Capri(QObject):
             self.vanish.emit()
         else:
             follow = float(self.cfg["followup_seconds"])
-            self.awake_until = time.time() + follow
-            self.mode.emit("listening", follow)
+            if follow <= 0:  # после ответа не слушаем: следующая команда — снова с «Капри»
+                self.awake_until = 0
+                self.mode.emit("idle", 0.0)
+            else:
+                self.awake_until = time.time() + follow
+                self.mode.emit("listening", follow)
 
     def say(self, text):
         """Озвучивает текст. Возвращает True, если Капри перебили."""
@@ -733,7 +785,12 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     cfg = load_config()
 
-    avatar = Avatar(os.path.join(BASE, "assets"))
+    try:
+        skin = skins.find(os.path.join(BASE, "assets"), cfg.get("skin", ""))
+        avatar = Avatar(skin)
+    except Exception:  # свой скин не загрузился — стартуем со стандартной Капри, а не падаем
+        log.exception("Скин %r не загрузился", cfg.get("skin"))
+        avatar = Avatar(skins.builtin(os.path.join(BASE, "assets")))
     avatar.hide_after = float(cfg["hide_after_seconds"])
     apply_user(cfg)
     capri = Capri(cfg)
@@ -769,105 +826,30 @@ def main():
         capri.reload_config_if_changed(speak=False)
         show_window("entries", lambda: EntriesDialog(capri.actions))
 
-    def open_sound():
-        from sound_dialog import SoundDialog
-        show_window("sound", lambda: SoundDialog(capri))
+    def open_settings(tab="general"):
+        from settings_window import SettingsWindow
+        capri.reload_config_if_changed(speak=False)
+        show_window("settings", lambda: SettingsWindow(capri, avatar, open_entries,
+                                                       lambda: os.startfile(CONFIG_PATH),
+                                                       lambda: capri.actions.web(CAPRI_URL), tab))
 
-    def open_profile():
-        from profile_dialog import ProfileDialog
-        show_window("profile", lambda: ProfileDialog(capri))
-
+    # в трее — только самое нужное, всё остальное в «Настройках»
     menu = QMenu()
     for title, fn in (("Позвать Капри", capri.call_from_click),
                       ("Замолчать", capri.interrupt),
                       ("Написать команду…", ask_text),
-                      ("Мои сайты, программы и ответы…", open_entries),
-                      ("Как ко мне обращаться…", open_profile),
+                      ("Настройки…", lambda: open_settings()),
                       ("Проверить ПК", lambda: capri.text_command("проверь компьютер")),
                       ("Спрятать", avatar.vanish),
-                      ("MIC", None),
-                      ("SEARCH", None),
-                      ("Открыть config.json", lambda: os.startfile(CONFIG_PATH)),
-                      ("Капри на GitHub (обновления)…", lambda: capri.actions.web(CAPRI_URL)),
                       (None, None),
                       ("Выход", app.quit)):
         if title is None:
             menu.addSeparator()
             continue
-        if title == "MIC":
-            mic_menu = menu.addMenu("Микрофон")
-
-            def fill_mics(m=mic_menu):
-                """Список устройств ввода строится при каждом открытии — чтобы видеть только что подключённые."""
-                m.clear()
-                chosen = capri.cfg.get("mic_device")
-                options = [(None, f"По умолчанию (как в Windows: {default_input_name()})")]
-                try:
-                    options += [(n, n) for n, _ in input_devices()]
-                except Exception:
-                    log.exception("Не удалось получить список микрофонов")
-                for value, label in options:
-                    a = QAction(label, m)
-                    a.setCheckable(True)
-                    a.setChecked(value == chosen or (value is None and not chosen))
-                    a.triggered.connect(lambda _=False, v=value: capri.set_mic(v))
-                    m.addAction(a)
-                m.addSeparator()
-                tune = QAction("Громкость и чувствительность…", m)
-                tune.triggered.connect(open_sound)
-                m.addAction(tune)
-            mic_menu.aboutToShow.connect(fill_mics)
-
-            # «Громкость Капри» — ползунок прямо в меню, чтобы не лезть в микшер громкости Windows
-            vol_menu = menu.addMenu("Громкость Капри")
-            box = QWidget()
-            row = QHBoxLayout(box)
-            row.setContentsMargins(10, 6, 10, 6)
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(0, 100)
-            slider.setMinimumWidth(180)
-            value = QLabel()
-            value.setMinimumWidth(36)
-            row.addWidget(slider)
-            row.addWidget(value)
-            slider.valueChanged.connect(lambda v, lbl=value: lbl.setText(f"{v}%"))
-            slider.sliderReleased.connect(lambda s=slider: capri.set_voice_volume(s.value()))
-            slider.valueChanged.connect(lambda v, s=slider: None if s.isSliderDown() else capri.set_voice_volume(v))
-            wa = QWidgetAction(vol_menu)
-            wa.setDefaultWidget(box)
-            vol_menu.addAction(wa)
-
-            def sync_volume(s=slider, lbl=value):
-                s.blockSignals(True)
-                s.setValue(int(capri.cfg.get("voice_volume", 100)))
-                s.blockSignals(False)
-                lbl.setText(f"{s.value()}%")
-            vol_menu.aboutToShow.connect(sync_volume)
-            continue
-        if title == "SEARCH":
-            # галочка: открывать ли Google, когда Капри не знает ответа (search_when_unsure)
-            search_act = QAction("Искать в браузере, если не знаю", menu)
-            search_act.setCheckable(True)
-            search_act.toggled.connect(capri.set_search_when_unsure)
-            menu.addAction(search_act)
-
-            # галочка: появляется ли Капри сама время от времени (chatter)
-            chatter_act = QAction("Появляться самой", menu)
-            chatter_act.setCheckable(True)
-            chatter_act.toggled.connect(capri.set_chatter)
-            menu.addAction(chatter_act)
-
-            def sync_search(a=search_act, b=chatter_act):
-                capri.reload_config_if_changed(speak=False)  # могли поменять в config.json руками
-                for act, key, default in ((a, "search_when_unsure", True), (b, "chatter", True)):
-                    act.blockSignals(True)
-                    act.setChecked(bool(capri.cfg.get(key, default)))
-                    act.blockSignals(False)
-            menu.aboutToShow.connect(sync_search)
-            continue
         act = QAction(title, menu)
         act.triggered.connect(fn)
         menu.addAction(act)
+    capri.settings.connect(open_settings, Qt.ConnectionType.QueuedConnection)
 
     tray = QSystemTrayIcon(tray_icon())
     tray.setToolTip("Капри — голосовой ассистент")
